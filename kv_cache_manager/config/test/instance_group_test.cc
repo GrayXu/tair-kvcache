@@ -193,4 +193,40 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, CacheReclaimFairnessProtoRoundTripPreservesExplicitFalse) {
+    CacheConfig original;
+    auto reclaim_strategy = std::make_shared<CacheReclaimStrategy>();
+    reclaim_strategy->set_enable_instance_fairness(false);
+    original.set_reclaim_strategy(reclaim_strategy);
+
+    proto::admin::CacheConfig proto_config;
+    ProtoConvert::CacheConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.reclaim_strategy().has_enable_instance_fairness());
+    EXPECT_FALSE(proto_config.reclaim_strategy().enable_instance_fairness().value());
+
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&proto_config, restored);
+    ASSERT_NE(nullptr, restored.reclaim_strategy());
+    EXPECT_FALSE(restored.reclaim_strategy()->enable_instance_fairness());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimFairnessProtoDefaultsToTrueWhenMissing) {
+    proto::admin::CacheConfig proto_config;
+    proto_config.mutable_reclaim_strategy();
+
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&proto_config, restored);
+    ASSERT_NE(nullptr, restored.reclaim_strategy());
+    EXPECT_TRUE(restored.reclaim_strategy()->enable_instance_fairness());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimFairnessJsonDefaultsToTrueAndAcceptsFalse) {
+    CacheReclaimStrategy reclaim_strategy;
+    ASSERT_TRUE(reclaim_strategy.FromJsonString("{}"));
+    EXPECT_TRUE(reclaim_strategy.enable_instance_fairness());
+
+    ASSERT_TRUE(reclaim_strategy.FromJsonString(R"({"enable_instance_fairness": false})"));
+    EXPECT_FALSE(reclaim_strategy.enable_instance_fairness());
+}
+
 } // namespace kv_cache_manager

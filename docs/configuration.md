@@ -200,7 +200,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 "trigger_strategy": {
                     "used_percentage": 0.8 # 控制数据用量水位，当用量达到或超过quota * percentage时将触发回收（逐出）
                 },
-                "delay_before_delete_ms": 1000 # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "delay_before_delete_ms": 1000, # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "enable_instance_fairness": true # 是否按各 Instance 当前用量分配本轮采样/逐出预算；缺省为 true，false 完整回退旧的固定 per-instance 行为
             },
             # cache_prefer_strategy与storage candidates一起控制storage backend选择策略，可选值如下：
             # enum class CachePreferStrategy {
