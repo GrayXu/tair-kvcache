@@ -903,7 +903,9 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                         const proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     SPAN_TRACER(request_context);
-    API_CALL_GUARD("GetHostCacheState", true);
+    // This is a best-effort read of the node's local ReportEvent view. Followers may
+    // serve a stale view, while ReportEvent mutations remain leader-only.
+    API_CALL_GUARD("GetHostCacheState", false);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
     std::string invalid_fields = "missing or invalid fields: ";
