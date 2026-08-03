@@ -236,7 +236,8 @@ cc_library(
         ":meta_storage_backend",
         ":utils",
         "//kv_cache_manager/common:client_pool",
-        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common/redis:redis_client",
+        "//kv_cache_manager/common/redis:redis_client_factory",
     ],
 )
 
@@ -268,10 +269,10 @@ cc_library(
         ":utils",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:client_pool",
-        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common/redis:redis_client",
+        "//kv_cache_manager/common/redis:redis_client_factory",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/config",
     ],
 )
-
