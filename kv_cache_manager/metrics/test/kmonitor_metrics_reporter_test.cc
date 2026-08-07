@@ -109,6 +109,24 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetCounter("cache_gc.delete_result_count", {{"status", "0"}}) += 1;
         metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "scan"}}) += 1;
         metrics_registry_->GetGauge("cache_gc.inflight_delete_count") = 2;
+        metrics_registry_->GetGauge("cache_gc.event_report_intent_count", {{"reason", "down_host"}}) = 3;
+        metrics_registry_->GetCounter("cache_gc.event_report_intent_update_count",
+                                      {{"reason", "down_host"}, {"result", "created"}}) += 1;
+        metrics_registry_->GetGauge("cache_gc.event_report_active_instance_count") = 2;
+        metrics_registry_->GetGauge("cache_gc.event_report_oldest_intent_age_ms") = 100;
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_pending_instance_count") = 1;
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_observation_count") = 2;
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_complete") = 0;
+        metrics_registry_->GetCounter("cache_gc.event_report_scan_batch_count") += 1;
+        metrics_registry_->GetCounter("cache_gc.event_report_scan_key_count") += 8;
+        metrics_registry_->GetCounter("cache_gc.event_report_scan_pass_count", {{"status", "complete"}}) += 1;
+        metrics_registry_->GetCounter("cache_gc.event_report_delete_location_count",
+                                      {{"reason", "down_host"}, {"status", "deleted"}}) += 2;
+        metrics_registry_->GetCounter("cache_gc.event_report_retry_count", {{"stage", "sync"}}) += 1;
+        metrics_registry_->GetGauge("cache_gc.event_report_last_pass_duration_ms") = 10;
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_duration_ms") = 3;
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_wait_us") = 7;
+        metrics_registry_->GetGauge("cache_gc.event_report_sync_retry_batch_count") = 1;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 

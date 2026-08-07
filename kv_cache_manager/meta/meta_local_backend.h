@@ -139,9 +139,16 @@ public:
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept override;
+    std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
+                                                        const KeyTypeVec &keys,
+                                                        LocationIdsPerKey &out_location_ids) noexcept override;
     std::vector<ErrorCode> GetProperties(RequestContext *request_context,
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
@@ -161,6 +168,9 @@ public:
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept override;
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept override;
     ErrorCode RandomSample(RequestContext *request_context,
                            const int64_t count,
                            std::vector<KeyType> &out_keys) noexcept override;
@@ -206,6 +216,9 @@ private:
                            CacheLocationMap *out_location_map,
                            PropertyMap *out_property_map,
                            std::vector<LocationId> *out_location_ids);
+    ErrorCode GetForOneKeyForMaintenance(KeyType key,
+                                         CacheLocationMap *out_location_map,
+                                         std::vector<LocationId> *out_location_ids);
 
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;

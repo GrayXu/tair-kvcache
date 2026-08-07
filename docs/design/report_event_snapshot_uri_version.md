@@ -389,6 +389,8 @@ snapshot replace + commit/abort
 
 ## 11. 限流与清理
 
+本节保留 legacy fallback 的行为说明；启用 `kvcm.cache_gc.event_report_cleanup_enabled` 后，系统按 [EventReport 主动回收纳入后台扫描 GC](event_report_background_gc.md) 把 per-event 全 Instance 扫描替换为可合并 cleanup intent。两条路径的 Snapshot、generation、lifecycle fencing 和 metadata-only 契约保持一致。
+
 `EventReportStorageSpec.snapshot_min_interval_ms` 提供 per-reporter 最小 snapshot 间隔，默认
 30 秒。完整维度是：
 

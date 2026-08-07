@@ -99,12 +99,26 @@ public:
                             uint64_t &out_retry_after_ms,
                             uint64_t *out_lifecycle_generation = nullptr);
     using LifecycleMutationLease = std::shared_ptr<std::shared_lock<std::shared_mutex>>;
+    enum class CleanupLeaseAcquireResult {
+        kAcquired,
+        kBusy,
+        kStale,
+    };
     ErrorCode AcquireLifecycleMutationLease(const ReporterSnapshotKey &reporter_key,
                                             uint64_t expected_generation,
                                             LifecycleMutationLease &out_lease) const;
     ErrorCode AcquireLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
                                            uint64_t expected_generation,
                                            LifecycleMutationLease &out_lease) const;
+    CleanupLeaseAcquireResult AcquireActiveLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                                                 uint64_t expected_generation,
+                                                                 LifecycleMutationLease &out_lease) const;
+    CleanupLeaseAcquireResult AcquireDownLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                                               uint64_t expected_generation,
+                                                               LifecycleMutationLease &out_lease) const;
+    CleanupLeaseAcquireResult AcquireAbsentReporterCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                                                uint64_t &out_generation,
+                                                                LifecycleMutationLease &out_lease);
     bool CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     void AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     std::string GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const;
@@ -120,6 +134,8 @@ public:
                                  bool &out_strict,
                                  std::string &out_committed) const;
     uint64_t GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const;
+    int64_t GetHeartbeatTimeoutMs() const noexcept { return heartbeat_timeout_ms_; }
+    int64_t GetCleanupGraceMs() const noexcept { return cleanup_grace_ms_; }
     void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
     void SetSnapshotDeltaDrainTimeoutMsForTest(int64_t timeout_ms);
     DataStorageType GetStorageType() const;

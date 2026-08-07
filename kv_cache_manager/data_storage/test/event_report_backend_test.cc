@@ -488,6 +488,61 @@ TEST_F(EventReportBackendTest, LifecycleCleanupLeaseDoesNotBlockUnrelatedReporte
     EXPECT_EQ(EC_OK, backend.AcquireLifecycleMutationLease(reporter_b, generation_b, mutation_lease_b));
 }
 
+TEST_F(EventReportBackendTest, GcCleanupLeasesDistinguishBusyFromStaleLifecycle) {
+    EventReportBackend backend(metrics_registry_);
+    const ReporterSnapshotKey reporter{"gc-cleanup-lease", "10.0.0.95:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
+    const uint64_t active_generation = backend.GetNodeGeneration(reporter.instance_id, reporter.host_ip_port);
+
+    EventReportBackend::LifecycleMutationLease lease;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireActiveLifecycleCleanupLease(reporter, active_generation, lease));
+    lease.reset();
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireActiveLifecycleCleanupLease(reporter, active_generation + 1, lease));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireDownLifecycleCleanupLease(reporter, active_generation, lease));
+
+    const auto fence = backend.FindLifecycleFence(reporter);
+    ASSERT_TRUE(fence);
+    std::promise<void> writer_acquired;
+    std::promise<void> release_writer;
+    const auto release_writer_future = release_writer.get_future().share();
+    auto writer = std::async(std::launch::async, [fence, &writer_acquired, release_writer_future] {
+        std::unique_lock<std::shared_mutex> lock(fence->mutex);
+        writer_acquired.set_value();
+        release_writer_future.wait();
+    });
+    ASSERT_EQ(std::future_status::ready, writer_acquired.get_future().wait_for(1s));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireActiveLifecycleCleanupLease(reporter, active_generation, lease));
+    release_writer.set_value();
+    ASSERT_EQ(std::future_status::ready, writer.wait_for(1s));
+    writer.get();
+
+    uint64_t down_generation = 0;
+    ASSERT_EQ(EC_OK, backend.UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, down_generation));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireDownLifecycleCleanupLease(reporter, down_generation, lease));
+    lease.reset();
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireActiveLifecycleCleanupLease(reporter, down_generation, lease));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireDownLifecycleCleanupLease(reporter, down_generation, lease));
+
+    const ReporterSnapshotKey absent_reporter{"gc-cleanup-lease", "10.0.0.96:8080"};
+    uint64_t absent_generation = 99;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireAbsentReporterCleanupLease(absent_reporter, absent_generation, lease));
+    EXPECT_EQ(0, absent_generation);
+    lease.reset();
+    ASSERT_EQ(EC_OK, backend.RegisterNode(absent_reporter.instance_id, absent_reporter.host_ip_port, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireAbsentReporterCleanupLease(absent_reporter, absent_generation, lease));
+}
+
 TEST_F(EventReportBackendTest, EnsureNodeRegisteredMergesNewMediums) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered("medium-merge", "10.0.0.91:8080", {"mem"}));

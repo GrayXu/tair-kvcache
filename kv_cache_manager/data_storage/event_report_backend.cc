@@ -594,8 +594,14 @@ void EventReportBackend::LivenessCheckerLoop() {
                 cb_copy = cleanup_callback_;
             }
             for (const auto &entry : to_cleanup) {
+                // Publish cleanup work before the generation-checked unregister. This
+                // preserves the existing heartbeat fencing window: a heartbeat that
+                // wins while the callback is running advances the generation, so the
+                // unregister below cannot remove the recovered reporter. Consumers
+                // must treat the callback as an intent only and re-check lifecycle
+                // state before deleting metadata.
                 KVCM_LOG_WARN("EventReportBackend: node [%s] instance [%s] passed cleanup_grace_ms, "
-                              "triggering cleanup (gen=%" PRIu64 ")",
+                              "triggering cleanup intent (gen=%" PRIu64 ")",
                               entry.host.c_str(),
                               entry.instance_id.c_str(),
                               entry.gen);
@@ -610,6 +616,16 @@ void EventReportBackend::LivenessCheckerLoop() {
                                   entry.host.c_str(),
                                   entry.gen,
                                   current_gen);
+                    continue;
+                }
+                if (unregister_ec != EC_OK) {
+                    KVCM_LOG_WARN("EventReportBackend: failed to unregister timed-out node [%s] instance [%s], "
+                                  "gen=%" PRIu64 " ec=%d",
+                                  entry.host.c_str(),
+                                  entry.instance_id.c_str(),
+                                  entry.gen,
+                                  static_cast<int>(unregister_ec));
+                    continue;
                 }
             }
         }
@@ -914,6 +930,66 @@ ErrorCode EventReportBackend::AcquireLifecycleCleanupLease(const ReporterSnapsho
     }
     out_lease = std::move(lease);
     return EC_OK;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireActiveLifecycleCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t expected_generation, LifecycleMutationLease &out_lease) const {
+    out_lease.reset();
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (!lifecycle_fence->registered || lifecycle_fence->generation != expected_generation) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireDownLifecycleCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t expected_generation, LifecycleMutationLease &out_lease) const {
+    out_lease.reset();
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->generation != expected_generation) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    // The liveness loop publishes a cleanup intent before performing its
+    // generation-checked unregister so a concurrent heartbeat can still win.
+    // An active reporter in that same generation is therefore transient, not
+    // stale; retry after the liveness callback finishes the unregister.
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireAbsentReporterCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t &out_generation, LifecycleMutationLease &out_lease) {
+    out_generation = 0;
+    out_lease.reset();
+    const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    out_generation = lifecycle_fence->generation;
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
 }
 
 bool EventReportBackend::CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version) {

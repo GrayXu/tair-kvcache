@@ -682,6 +682,24 @@ bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {
     return barrier_ctx->Wait(std::chrono::milliseconds{sync_timeout_ms_});
 }
 
+bool MetaAsyncRedisBackend::SyncAll() noexcept {
+    if (!is_running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (queues_.empty()) {
+        return true;
+    }
+
+    auto barrier_ctx = std::make_shared<BarrierContext>();
+    barrier_ctx->remain.store(static_cast<int>(queues_.size()), std::memory_order_release);
+    for (auto &queue : queues_) {
+        SyncBarrierItem item;
+        item.barrier_ctx = barrier_ctx;
+        queue->Push(QueueItem{std::move(item)});
+    }
+    return barrier_ctx->Wait(std::chrono::milliseconds{sync_timeout_ms_});
+}
+
 // ==================== Metrics ====================
 
 MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() noexcept {

@@ -1930,6 +1930,105 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
     return result.ec;
 }
 
+MetaSearcher::MaintenanceDeleteBatchResult
+MetaSearcher::BatchDeleteLocationsForMaintenance(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 const LocationIdsPerKey &location_ids_per_key,
+                                                 const std::vector<std::vector<std::string>> &expected_location_values,
+                                                 const MaintenanceLocationDeleteResults *prior_results) {
+    MaintenanceDeleteBatchResult out;
+    if (!request_context || keys.size() != location_ids_per_key.size() ||
+        keys.size() != expected_location_values.size()) {
+        out.ec = EC_BADARGS;
+        return out;
+    }
+
+    std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> location_usage(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids_per_key[i].size() != expected_location_values[i].size()) {
+            out.ec = EC_BADARGS;
+            return out;
+        }
+        location_usage[i].resize(location_ids_per_key[i].size());
+        for (size_t j = 0; j < expected_location_values[i].size(); ++j) {
+            CacheLocation location;
+            if (!location.FromJsonString(expected_location_values[i][j])) {
+                out.ec = EC_BADARGS;
+                return out;
+            }
+            std::uint64_t size = 0;
+            for (const auto &spec : location.location_specs()) {
+                DataStorageUri uri(spec.uri());
+                std::uint64_t spec_size = 0;
+                if (uri.Valid()) {
+                    uri.GetParamAs<std::uint64_t>("size", spec_size);
+                    size += spec_size;
+                }
+            }
+            location_usage[i][j] = {location.type(), size};
+        }
+    }
+
+    auto result = meta_indexer_->CompareDeleteLocationsForMaintenance(
+        request_context, keys, location_ids_per_key, expected_location_values);
+    out.ec = result.ec;
+    out.shard_lock_wait_time_us = result.shard_lock_wait_time_us;
+    out.per_location_results = std::move(result.per_location_results);
+    if (out.per_location_results.size() != keys.size()) {
+        out.ec = EC_ERROR;
+        return out;
+    }
+
+    bool prior_shape_valid = prior_results != nullptr && prior_results->size() == keys.size();
+    if (prior_shape_valid) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if ((*prior_results)[i].size() != out.per_location_results[i].size()) {
+                prior_shape_valid = false;
+                break;
+            }
+        }
+    }
+    if (prior_results && !prior_shape_valid) {
+        out.ec = EC_BADARGS;
+        return out;
+    }
+
+    bool needs_sync = false;
+    for (size_t i = 0; i < out.per_location_results.size(); ++i) {
+        for (size_t j = 0; j < out.per_location_results[i].size(); ++j) {
+            auto &current = out.per_location_results[i][j];
+            if (current.ec == EC_OK || current.ec == EC_NOENT) {
+                if (prior_shape_valid) {
+                    const auto &prior = (*prior_results)[i][j];
+                    current.removed_from_hot = current.removed_from_hot || prior.removed_from_hot;
+                    current.removed_from_persistent = current.removed_from_persistent || prior.removed_from_persistent;
+                    current.reclaimed_hot_key = current.reclaimed_hot_key || prior.reclaimed_hot_key;
+                    current.reclaimed_persistent_key =
+                        current.reclaimed_persistent_key || prior.reclaimed_persistent_key;
+                }
+                needs_sync = needs_sync || current.removed_from_hot || current.removed_from_persistent ||
+                             current.reclaimed_hot_key || current.reclaimed_persistent_key;
+            }
+        }
+    }
+
+    if (needs_sync && !meta_indexer_->Sync(keys)) {
+        out.ec = EC_TIMEOUT;
+        return out;
+    }
+    out.sync_succeeded = true;
+    if (out.ec != EC_OK) {
+        // Preserve the per-layer mutation flags for the bounded retry batch.
+        // Accounting is committed only after every hard error has converged;
+        // otherwise a partially successful attempt could be counted twice.
+        return out;
+    }
+    meta_indexer_->CommitMaintenanceDeleteAccounting(location_usage, out.per_location_results);
+    return out;
+}
+
+bool MetaSearcher::SyncAllForMaintenance() noexcept { return meta_indexer_ && meta_indexer_->SyncAll(); }
+
 ErrorCode
 MetaSearcher::VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor) {
     if (!visitor) {

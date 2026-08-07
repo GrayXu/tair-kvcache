@@ -60,6 +60,10 @@ class MetaServiceHttpClient(cases.MetaServiceClientBase):
         """Finish writing cache data"""
         return self._make_api_request('/api/finishWriteCache', data, check_response)
 
+    def report_event(self, data, check_response=True):
+        """Report external cache lifecycle events"""
+        return self._make_api_request('/api/reportEvent', data, check_response)
+
     def remove_cache(self, data, check_response=True):
         """Remove cache data for specified block keys"""
         return self._make_api_request('/api/removeCache', data, check_response)

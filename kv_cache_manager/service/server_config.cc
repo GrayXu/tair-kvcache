@@ -202,6 +202,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_gc_max_inflight_delete_requests_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.cache_gc.event_report_cleanup_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_gc_event_report_cleanup_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -287,6 +292,7 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_gc_scan_batch_size_ = 256;
     cache_gc_orphan_writing_grace_period_ms_ = 24LL * 60 * 60 * 1000;
     cache_gc_max_inflight_delete_requests_ = 2;
+    cache_gc_event_report_cleanup_enabled_ = false;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {
@@ -434,6 +440,10 @@ bool ServerConfig::Check() {
                 "Cache GC intervals, batch size and max in-flight requests must be greater than zero, and orphan "
                 "WRITING grace must be at least %ldms\n",
                 kMinCacheGcOrphanWritingGracePeriodMs);
+        return false;
+    }
+    if (cache_gc_event_report_cleanup_enabled_ && !cache_gc_enabled_) {
+        fprintf(stderr, "EventReport GC cleanup requires kvcm.cache_gc.enabled=true\n");
         return false;
     }
 

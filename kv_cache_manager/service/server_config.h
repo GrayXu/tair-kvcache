@@ -56,6 +56,7 @@ public:
     uint64_t GetCacheGcScanBatchSize() const { return cache_gc_scan_batch_size_; }
     int64_t GetCacheGcOrphanWritingGracePeriodMs() const { return cache_gc_orphan_writing_grace_period_ms_; }
     uint64_t GetCacheGcMaxInflightDeleteRequests() const { return cache_gc_max_inflight_delete_requests_; }
+    bool IsCacheGcEventReportCleanupEnabled() const { return cache_gc_event_report_cleanup_enabled_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
@@ -113,6 +114,7 @@ private:
     uint64_t cache_gc_scan_batch_size_ = 0;
     int64_t cache_gc_orphan_writing_grace_period_ms_ = 0;
     uint64_t cache_gc_max_inflight_delete_requests_ = 0;
+    bool cache_gc_event_report_cleanup_enabled_ = false;
     std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;
     int64_t metrics_report_interval_ms_ = 0;

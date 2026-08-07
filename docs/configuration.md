@@ -124,6 +124,9 @@ kvcm.cache_gc.scan_batch_size=256
 kvcm.cache_gc.orphan_writing_grace_period_ms=86400000
 # GC 在途删除请求硬上限；默认 2。一个慢请求只占一个槽位，全部槽位占满后暂停扫描。
 kvcm.cache_gc.max_inflight_delete_requests=2
+# 迁移期开关：将 EventReport Snapshot/HOST_DOWN 回收路由到 GC cleanup intent lane；
+# 默认关闭，开启时要求 kvcm.cache_gc.enabled=true，配置变更需重启生效。
+kvcm.cache_gc.event_report_cleanup_enabled=false
 
 # 可选值有dummy，local，logging，kmonitor；若不配置或配置为空，默认使用local
 kvcm.metrics.reporter_type=local

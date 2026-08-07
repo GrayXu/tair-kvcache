@@ -65,6 +65,18 @@ struct MaintenanceScanBatch {
     }
 };
 
+// Per-target outcome of a maintenance compare-delete. Layer flags describe
+// mutations accepted during this call; they let callers defer accounting
+// until an asynchronous persistent backend has crossed its Sync barrier.
+struct MaintenanceLocationDeleteResult {
+    ErrorCode ec = EC_OK;
+    bool removed_from_hot = false;
+    bool removed_from_persistent = false;
+    bool reclaimed_hot_key = false;
+    bool reclaimed_persistent_key = false;
+};
+using MaintenanceLocationDeleteResults = std::vector<std::vector<MaintenanceLocationDeleteResult>>;
+
 // ---------- Read-Modify-Write helpers ----------
 // Action codes shared by both block-level and location-level RMW modifiers.
 enum ModifierAction {

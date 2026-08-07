@@ -33,6 +33,7 @@
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
+#include "kv_cache_manager/manager/event_report_cleanup_util.h"
 #include "kv_cache_manager/manager/hash_util.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -475,6 +476,7 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(std::move(cache_gc_config),
                                                                        registry_manager_,
                                                                        meta_indexer_manager_,
+                                                                       meta_searcher_manager_,
                                                                        registry_manager_->data_storage_manager(),
                                                                        schedule_plan_executor_,
                                                                        metrics_registry_,
@@ -2403,54 +2405,6 @@ bool ParseInt64(const std::string &s, int64_t &out) {
     } catch (...) { return false; }
 }
 
-bool IsSnapshotLocationStale(const EventReportBackend *event_backend,
-                             const std::string &instance_id,
-                             const CacheLocation &location,
-                             bool preserve_in_flight = false) {
-    if (!event_backend) {
-        return false;
-    }
-
-    std::string medium;
-    std::string reporter_host;
-    if (!event_backend->ParseLocationId(location.id(), medium, reporter_host)) {
-        return false;
-    }
-
-    const ReporterSnapshotKey reporter_key{instance_id, reporter_host};
-    std::string committed_version;
-    std::string in_flight_version;
-    event_backend->GetSnapshotVersionTokens(reporter_key, committed_version, in_flight_version);
-    if (location.location_specs().empty()) {
-        return true;
-    }
-    bool contains_committed = false;
-    bool contains_in_flight = false;
-    for (const auto &spec : location.location_specs()) {
-        const size_t version_param_count =
-            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
-        if (version_param_count == 0) {
-            // Legacy metadata is a stale reconciliation component, but a
-            // current delta spec in the same stable location still protects
-            // the location from coarse-grained cleanup.
-            continue;
-        }
-        SnapshotUriInfo info;
-        if (version_param_count != 1 || !SnapshotUriUtils::ParseSnapshotUriInfo(spec.uri(), info)) {
-            return true;
-        }
-        contains_committed = contains_committed || (!committed_version.empty() && info.version == committed_version);
-        contains_in_flight = contains_in_flight ||
-                             (preserve_in_flight && !in_flight_version.empty() && info.version == in_flight_version);
-    }
-    // Delta merge is spec-granular and can temporarily leave multiple
-    // generations in one stable location. Cleanup is location-granular, so it
-    // must preserve the whole location when any current/in-flight spec is
-    // present; deleting stale sibling specs is deferred to a later complete
-    // snapshot rather than risking a false negative for a successful delta.
-    return !contains_committed && !contains_in_flight;
-}
-
 bool IsEventReportLocationReadable(const CacheLocation &location,
                                    bool strict_query_visibility,
                                    const std::string &committed_version) {
@@ -2590,14 +2544,35 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     refresh_snapshot_response(false);
 
     if (!event_backend->IsCleanupCallbackSet()) {
-        event_backend->SetCleanupCallback([this, requested_type](const std::string &cleanup_instance,
-                                                                 const std::string &down_host,
-                                                                 uint64_t generation) {
-            assert(this->schedule_plan_executor_);
-            this->schedule_plan_executor_->SubmitTask([this, cleanup_instance, down_host, generation, requested_type] {
-                this->CleanupHostLocations(cleanup_instance, down_host, generation, requested_type);
+        const std::weak_ptr<EventReportBackend> weak_backend = event_backend;
+        if (cache_garbage_collector_ && cache_garbage_collector_->IsEventReportCleanupEnabled()) {
+            event_backend->SetCleanupCallback([this, requested_type, weak_backend](const std::string &cleanup_instance,
+                                                                                   const std::string &down_host,
+                                                                                   uint64_t generation) {
+                if (auto backend = weak_backend.lock()) {
+                    if (!cache_garbage_collector_->RegisterHostCleanupIntent(
+                            cleanup_instance, requested_type, down_host, generation, backend)) {
+                        KVCM_INTERVAL_LOG_WARN(
+                            10,
+                            "EventReport liveness cleanup intent rejected, instance[%s] host[%s] generation[%" PRIu64
+                            "]",
+                            cleanup_instance.c_str(),
+                            down_host.c_str(),
+                            generation);
+                    }
+                }
             });
-        });
+        } else {
+            event_backend->SetCleanupCallback([this, requested_type](const std::string &cleanup_instance,
+                                                                     const std::string &down_host,
+                                                                     uint64_t generation) {
+                assert(this->schedule_plan_executor_);
+                this->schedule_plan_executor_->SubmitTask(
+                    [this, cleanup_instance, down_host, generation, requested_type] {
+                        this->CleanupHostLocations(cleanup_instance, down_host, generation, requested_type);
+                    });
+            });
+        }
     }
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
@@ -2661,6 +2636,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         ReporterSnapshotKey reporter_key;
         std::string version;
         uint64_t attempt_epoch;
+        uint64_t lifecycle_generation;
         int event_index;
     };
     struct DeltaSpecMutation {
@@ -2933,8 +2909,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 request_snapshot_version.clear();
                 break;
             }
-            snapshot_commit_tasks.push_back(SnapshotCommitTask{
-                reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i});
+            snapshot_commit_tasks.push_back(SnapshotCommitTask{reporter_key,
+                                                               request_snapshot_version,
+                                                               event_backend->GetSnapshotAttemptEpoch(reporter_key),
+                                                               mutation_lifecycle_generation,
+                                                               i});
             break;
         }
         default:
@@ -2972,6 +2951,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 }
             }
         }
+    }
+    if (!has_host_down && event_backend->IsNodeRegistered(instance_id, host_ip_port) && cache_garbage_collector_ &&
+        cache_garbage_collector_->IsEventReportCleanupEnabled()) {
+        cache_garbage_collector_->CancelHostCleanupIntent(instance_id, requested_type, host_ip_port);
     }
 
     if (!block_to_add.empty()) {
@@ -3210,6 +3193,19 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[task.event_index] = EC_ERROR;
             }
             event_backend->AbortSnapshotVersion(task.reporter_key, task.version);
+        } else if (cache_garbage_collector_ && cache_garbage_collector_->IsEventReportCleanupEnabled()) {
+            if (!cache_garbage_collector_->RegisterSnapshotCleanupIntent(task.reporter_key.instance_id,
+                                                                         requested_type,
+                                                                         task.reporter_key.host_ip_port,
+                                                                         task.version,
+                                                                         task.attempt_epoch,
+                                                                         task.lifecycle_generation,
+                                                                         event_backend)) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to register GC cleanup intent for "
+                              "host [%s]",
+                              trace_id.c_str(),
+                              task.reporter_key.host_ip_port.c_str());
+            }
         } else if (schedule_plan_executor_) {
             const auto cleanup_backend = event_backend;
             if (!schedule_plan_executor_->SubmitTask([this,
@@ -3230,12 +3226,27 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (has_host_down) {
         uint64_t gen_at_trigger = 0;
-        event_backend->UnregisterNodeForHostDown(instance_id, host_ip_port, gen_at_trigger);
-        assert(schedule_plan_executor_);
-        const bool cleanup_scheduled =
-            schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
-                this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
-            });
+        const ErrorCode unregister_ec =
+            event_backend->UnregisterNodeForHostDown(instance_id, host_ip_port, gen_at_trigger);
+        if (unregister_ec != EC_OK) {
+            for (int i = 0; i < events_size; ++i) {
+                if (request->events(i).event_type() == proto::meta::EVENT_HOST_DOWN && per_item_ec[i] == EC_OK) {
+                    per_item_ec[i] = unregister_ec;
+                }
+            }
+        }
+        bool cleanup_scheduled = false;
+        if (unregister_ec == EC_OK && cache_garbage_collector_ &&
+            cache_garbage_collector_->IsEventReportCleanupEnabled()) {
+            cleanup_scheduled = cache_garbage_collector_->RegisterHostCleanupIntent(
+                instance_id, requested_type, host_ip_port, gen_at_trigger, event_backend);
+        } else if (unregister_ec == EC_OK) {
+            assert(schedule_plan_executor_);
+            cleanup_scheduled =
+                schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
+                    this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
+                });
+        }
         if (!cleanup_scheduled) {
             KVCM_LOG_WARN("trace_id [%s] | HOST_DOWN: failed to submit metadata cleanup for host [%s], "
                           "instance [%s], gen=%" PRIu64,
@@ -3244,12 +3255,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                           instance_id.c_str(),
                           gen_at_trigger);
         }
-        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] removed from node table, cleanup_scheduled=%s "
-                      "(gen=%" PRIu64 ")",
-                      trace_id.c_str(),
-                      host_ip_port.c_str(),
-                      cleanup_scheduled ? "true" : "false",
-                      gen_at_trigger);
+        if (unregister_ec == EC_OK) {
+            KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] removed from node table, cleanup_scheduled=%s "
+                          "(gen=%" PRIu64 ")",
+                          trace_id.c_str(),
+                          host_ip_port.c_str(),
+                          cleanup_scheduled ? "true" : "false",
+                          gen_at_trigger);
+        }
     }
 
     bool any_failure = false;
@@ -3423,7 +3436,7 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
         std::string reporter_host;
         return event_backend->ParseLocationId(location_id, medium, reporter_host) &&
                reporter_host == reporter_key.host_ip_port &&
-               IsSnapshotLocationStale(
+               IsSnapshotLocationStaleForCleanup(
                    event_backend.get(), reporter_key.instance_id, location, /*preserve_in_flight=*/true);
     };
     auto should_abort = [event_backend, reporter_key, snapshot_attempt_epoch] {

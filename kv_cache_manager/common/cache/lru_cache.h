@@ -326,6 +326,12 @@ public: // Function definitions expected as parameter to ShardedCache
                       Cache::Priority priority,
                       Statistics *stats);
 
+    bool ApplyToEntryNoTouch(
+        const std::string_view &key,
+        uint32_t hash,
+        const std::function<ssize_t(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
+            &callback);
+
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     bool Ref(LRUHandle *handle);
     bool Erase(const std::string_view &key, uint32_t hash);

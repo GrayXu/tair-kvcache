@@ -176,6 +176,22 @@ public:
                                    const std::vector<std::vector<std::string>> &expected_location_values = {},
                                    bool adjust_storage_usage = true,
                                    bool adjust_reclaimed_key_count = true);
+    struct MaintenanceDeleteBatchResult {
+        ErrorCode ec = EC_OK;
+        MaintenanceLocationDeleteResults per_location_results;
+        bool sync_succeeded = false;
+        int64_t shard_lock_wait_time_us = 0;
+    };
+    // Exact-value metadata-only maintenance deletion. The optional prior
+    // result carries mutations from a previous Sync failure so accounting is
+    // committed exactly once after a later successful barrier.
+    MaintenanceDeleteBatchResult
+    BatchDeleteLocationsForMaintenance(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids_per_key,
+                                       const std::vector<std::vector<std::string>> &expected_location_values,
+                                       const MaintenanceLocationDeleteResults *prior_results = nullptr);
+    bool SyncAllForMaintenance() noexcept;
     using LocationVisitor =
         std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);

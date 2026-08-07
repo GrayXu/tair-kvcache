@@ -311,6 +311,164 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteIsExactAndReclaimsLastLocationAtomically) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_compare_delete";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_delete", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({888});
+    batch.batch_locations[0].emplace("loc_second", MakeLocation("loc_second", "uri_second"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    const auto first_value = batch.batch_locations[0].at("loc_888")->ToJsonString();
+    auto first_result =
+        mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {888}, {{"loc_888"}}, {{first_value}});
+    ASSERT_EQ(1, first_result.size());
+    ASSERT_EQ(1, first_result[0].size());
+    EXPECT_EQ(EC_OK, first_result[0][0].ec);
+    EXPECT_TRUE(first_result[0][0].removed_from_hot);
+    EXPECT_TRUE(first_result[0][0].removed_from_persistent);
+    EXPECT_FALSE(first_result[0][0].reclaimed_hot_key);
+    EXPECT_FALSE(first_result[0][0].reclaimed_persistent_key);
+
+    CacheLocationMapVector remaining;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetLocations(nullptr, {888}, remaining));
+    ASSERT_EQ(1, remaining.size());
+    EXPECT_EQ(0, remaining[0].count("loc_888"));
+    EXPECT_EQ(1, remaining[0].count("loc_second"));
+
+    auto mismatch_result =
+        mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {888}, {{"loc_second"}}, {{first_value}});
+    ASSERT_EQ(1, mismatch_result.size());
+    ASSERT_EQ(1, mismatch_result[0].size());
+    EXPECT_EQ(EC_MISMATCH, mismatch_result[0][0].ec);
+
+    const auto second_value = batch.batch_locations[0].at("loc_second")->ToJsonString();
+    auto final_result =
+        mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {888}, {{"loc_second"}}, {{second_value}});
+    ASSERT_EQ(1, final_result.size());
+    ASSERT_EQ(1, final_result[0].size());
+    EXPECT_EQ(EC_OK, final_result[0][0].ec);
+    EXPECT_TRUE(final_result[0][0].reclaimed_hot_key);
+    EXPECT_TRUE(final_result[0][0].reclaimed_persistent_key);
+
+    std::vector<bool> hot_exists;
+    std::vector<bool> persistent_exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {888}, hot_exists));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Exists(nullptr, {888}, persistent_exists));
+    EXPECT_EQ((std::vector<bool>{false}), hot_exists);
+    EXPECT_EQ((std::vector<bool>{false}), persistent_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteUsesPersistentOnlyOnHotMissWithoutBackfill) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_persistent_only_delete";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_persistent_only", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({999});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(
+                  request_context_.get(), batch.batch_keys, batch.batch_locations, batch.batch_properties));
+    std::vector<bool> hot_exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {999}, hot_exists));
+    ASSERT_EQ((std::vector<bool>{false}), hot_exists);
+
+    const auto expected = batch.batch_locations[0].at("loc_999")->ToJsonString();
+    auto result = mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {999}, {{"loc_999"}}, {{expected}});
+    ASSERT_EQ(1, result.size());
+    ASSERT_EQ(1, result[0].size());
+    EXPECT_EQ(EC_OK, result[0][0].ec);
+    EXPECT_FALSE(result[0][0].removed_from_hot);
+    EXPECT_TRUE(result[0][0].removed_from_persistent);
+    EXPECT_FALSE(result[0][0].reclaimed_hot_key);
+    EXPECT_TRUE(result[0][0].reclaimed_persistent_key);
+
+    hot_exists.clear();
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {999}, hot_exists));
+    EXPECT_EQ((std::vector<bool>{false}), hot_exists);
+    std::vector<bool> persistent_exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Exists(nullptr, {999}, persistent_exists));
+    EXPECT_EQ((std::vector<bool>{false}), persistent_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteDoesNotReclaimAcrossDivergentLayers) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_divergent_layers";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_divergent", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    BatchMetaData complete;
+    complete.batch_keys = {1001, 1002};
+    complete.batch_indexs = {0, 1};
+    complete.batch_locations.resize(2);
+    complete.batch_properties.resize(2);
+    for (size_t i = 0; i < complete.batch_keys.size(); ++i) {
+        const auto suffix = std::to_string(complete.batch_keys[i]);
+        complete.batch_locations[i].emplace("target_" + suffix,
+                                            MakeLocation("target_" + suffix, "uri_target_" + suffix));
+        complete.batch_locations[i].emplace("other_" + suffix, MakeLocation("other_" + suffix, "uri_other_" + suffix));
+        complete.batch_properties[i]["p0"] = "p0_" + suffix;
+    }
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), complete));
+
+    // key 1001 models hot-ahead-of-persistent; key 1002 models the inverse.
+    CacheLocationMapVector target_only_locations(1);
+    PropertyMapVector target_only_properties(1);
+    target_only_locations[0].emplace("target_1001", complete.batch_locations[0].at("target_1001"));
+    target_only_properties[0]["p0"] = "p0_1001";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr, {1001}, target_only_locations, target_only_properties));
+
+    target_only_locations[0].clear();
+    target_only_properties[0].clear();
+    target_only_locations[0].emplace("target_1002", complete.batch_locations[1].at("target_1002"));
+    target_only_properties[0]["p0"] = "p0_1002";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(nullptr, {1002}, target_only_locations, target_only_properties));
+
+    auto result =
+        mgr.CompareDeleteLocationsForMaintenance(request_context_.get(),
+                                                 {1001, 1002},
+                                                 {{"target_1001"}, {"target_1002"}},
+                                                 {{complete.batch_locations[0].at("target_1001")->ToJsonString()},
+                                                  {complete.batch_locations[1].at("target_1002")->ToJsonString()}});
+    ASSERT_EQ(2u, result.size());
+    ASSERT_EQ(1u, result[0].size());
+    ASSERT_EQ(1u, result[1].size());
+    EXPECT_EQ(EC_OK, result[0][0].ec);
+    EXPECT_EQ(EC_OK, result[1][0].ec);
+    EXPECT_FALSE(result[0][0].reclaimed_persistent_key);
+    EXPECT_FALSE(result[0][0].reclaimed_hot_key);
+    EXPECT_FALSE(result[1][0].reclaimed_persistent_key);
+    EXPECT_FALSE(result[1][0].reclaimed_hot_key);
+
+    CacheLocationMapVector persistent_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.persistent_backend_->GetLocations(nullptr, {1001, 1002}, persistent_locations));
+    ASSERT_EQ(2u, persistent_locations.size());
+    EXPECT_TRUE(persistent_locations[0].empty());
+    EXPECT_EQ(1u, persistent_locations[1].count("other_1002"));
+
+    CacheLocationMapVector hot_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.cache_backend_->GetLocations(nullptr, {1001, 1002}, hot_locations));
+    ASSERT_EQ(2u, hot_locations.size());
+    EXPECT_EQ(1u, hot_locations[0].count("other_1001"));
+    EXPECT_TRUE(hot_locations[1].empty());
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
 // --- PutMetaData / GetMetaData always routed to persistent --------------------
 
 TEST_F(MetaStorageBackendManagerTest, TestPutGetMetaData) {

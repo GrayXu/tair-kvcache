@@ -84,6 +84,7 @@ public:
 
     // ----- Sync -----
     bool Sync(const KeyTypeVec &keys) noexcept override;
+    bool SyncAll() noexcept override;
 
     // ----- Metrics -----
     AsyncWriteStats GetAsyncWriteStats() noexcept override;

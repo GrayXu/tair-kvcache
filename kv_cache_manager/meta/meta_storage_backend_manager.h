@@ -52,6 +52,11 @@ public:
                                   const KeyVector &keys,
                                   const LocationIdsPerKey &location_ids,
                                   int32_t &out_reclaimed_count) noexcept;
+    MaintenanceLocationDeleteResults CompareDeleteLocationsForMaintenance(
+        RequestContext *request_context,
+        const KeyVector &keys,
+        const LocationIdsPerKey &location_ids,
+        const std::vector<std::vector<std::string>> &expected_location_values) noexcept;
 
     // ----- Read APIs -----
     std::vector<ErrorCode> Get(RequestContext *request_context,
@@ -104,6 +109,7 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
 
     // Returns async write stats from persistent backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;

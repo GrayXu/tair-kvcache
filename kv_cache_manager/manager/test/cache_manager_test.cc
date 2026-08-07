@@ -871,6 +871,7 @@ TEST_F(CacheManagerTest, TestCleanupStopsActiveCacheGarbageCollector) {
     auto collector = std::make_shared<CacheGarbageCollector>(config,
                                                              cache_manager_->registry_manager_,
                                                              cache_manager_->meta_indexer_manager_,
+                                                             cache_manager_->meta_searcher_manager_,
                                                              cache_manager_->registry_manager_->data_storage_manager(),
                                                              cache_manager_->schedule_plan_executor_,
                                                              cache_manager_->metrics_registry_,

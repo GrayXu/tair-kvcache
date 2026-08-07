@@ -101,7 +101,7 @@ V1 实现以下六项能力：
 4. 动态或大规模并发窗口、多维 bytes/Group 配额、Future deadline 和持久化任务。
 5. `WriteLocationManager` 三元组索引、settling guard，以及 Reclaimer/Finish 竞态修复。
 6. `CLS_DELETING` 自动恢复和 storage version/epoch。
-7. EventReport reconciliation、Block TTL 和闲置 Instance 清理。
+7. EventReport reconciliation、Block TTL 和闲置 Instance 清理；EventReport 后续方案见 [EventReport 主动回收纳入后台扫描 GC](event_report_background_gc.md)。
 8. 查询链路 fast-submit 重构。
 9. GC lease/generation、跨进程 cursor 或 pending 恢复。
 10. data storage I/O timeout/cancel 和 CAS 后补偿状态机。
@@ -605,7 +605,7 @@ Block TTL 需要先定义 TTL 写入、刷新、authoritative `expire_at`、并�
 4. GC task 持久化、lease/generation 和跨进程恢复；
 5. data storage I/O timeout/cancel；
 6. authoritative time source；
-7. EventReport snapshot/event 的后台 reconciliation；其 metadata-only、版本和所有权语义不能复用普通 storage 的物理删除规则。
+7. EventReport snapshot/event 的后台 reconciliation；其 metadata-only、版本和所有权语义不能复用普通 storage 的物理删除规则，独立设计见 [EventReport 主动回收纳入后台扫描 GC](event_report_background_gc.md)。
 
 ### 11.6 建议交付顺序
 

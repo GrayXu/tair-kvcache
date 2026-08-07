@@ -475,6 +475,30 @@ LRUHandle *LRUCacheShard::Lookup(const std::string_view &key,
     return e;
 }
 
+bool LRUCacheShard::ApplyToEntryNoTouch(
+    const std::string_view &key,
+    uint32_t hash,
+    const std::function<ssize_t(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)> &callback) {
+    std::lock_guard<std::mutex> l(mutex_);
+    LRUHandle *e = table_.Lookup(key, hash);
+    if (e == nullptr) {
+        return false;
+    }
+    assert(e->InCache());
+    const ssize_t delta = callback(e->value, e->total_charge, e->helper);
+    if (delta > 0) {
+        e->total_charge += static_cast<size_t>(delta);
+        usage_ += static_cast<size_t>(delta);
+    } else if (delta < 0) {
+        size_t decrease = static_cast<size_t>(-delta);
+        decrease = std::min(decrease, e->total_charge);
+        decrease = std::min(decrease, usage_);
+        e->total_charge -= decrease;
+        usage_ -= decrease;
+    }
+    return true;
+}
+
 bool LRUCacheShard::Ref(LRUHandle *e) {
     std::lock_guard<std::mutex> l(mutex_);
     // To create another reference - entry must be already externally referenced.

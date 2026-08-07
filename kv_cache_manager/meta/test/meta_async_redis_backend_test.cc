@@ -241,6 +241,18 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncMultiQueue) {
     ASSERT_TRUE(backend_->Sync(keys));
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestSyncAllFlushesEveryQueueAndRejectsStoppedBackend) {
+    ASSERT_EQ(EC_OK, InitAndOpen());
+
+    CacheLocationMapVector locations(2);
+    PropertyMapVector properties = {{{"field", "first"}}, {{"field", "second"}}};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), backend_->Put(nullptr, {10, 20}, locations, properties));
+    EXPECT_TRUE(backend_->SyncAll());
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+    EXPECT_FALSE(backend_->SyncAll());
+}
+
 // ==================== Read Operations (Passthrough) Tests ====================
 
 TEST_F(MetaAsyncRedisBackendTest, TestGetPassthrough) {

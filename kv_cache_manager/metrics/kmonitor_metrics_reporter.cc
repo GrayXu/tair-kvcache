@@ -170,6 +170,22 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, inflight_delete_count);
     DECLARE_METRICS(cache_gc, inflight_delete_age_ms);
     DECLARE_METRICS(cache_gc, round_duration_ms);
+    DECLARE_METRICS(cache_gc, event_report_intent_count);
+    DECLARE_METRICS(cache_gc, event_report_intent_update_count);
+    DECLARE_METRICS(cache_gc, event_report_active_instance_count);
+    DECLARE_METRICS(cache_gc, event_report_oldest_intent_age_ms);
+    DECLARE_METRICS(cache_gc, event_report_recovery_pending_instance_count);
+    DECLARE_METRICS(cache_gc, event_report_recovery_observation_count);
+    DECLARE_METRICS(cache_gc, event_report_recovery_complete);
+    DECLARE_METRICS(cache_gc, event_report_scan_batch_count);
+    DECLARE_METRICS(cache_gc, event_report_scan_key_count);
+    DECLARE_METRICS(cache_gc, event_report_scan_pass_count);
+    DECLARE_METRICS(cache_gc, event_report_delete_location_count);
+    DECLARE_METRICS(cache_gc, event_report_retry_count);
+    DECLARE_METRICS(cache_gc, event_report_last_pass_duration_ms);
+    DECLARE_METRICS(cache_gc, event_report_last_action_duration_ms);
+    DECLARE_METRICS(cache_gc, event_report_last_action_shard_lock_wait_us);
+    DECLARE_METRICS(cache_gc, event_report_sync_retry_batch_count);
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -444,6 +460,22 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_count);
     REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_age_ms);
     REGISTER_GAUGE_METRIC(cache_gc, round_duration_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_intent_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_intent_update_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_active_instance_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_oldest_intent_age_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_recovery_pending_instance_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_recovery_observation_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_recovery_complete);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_scan_batch_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_scan_key_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_scan_pass_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_retry_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_last_pass_duration_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_last_action_duration_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_last_action_shard_lock_wait_us);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_sync_retry_batch_count);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -820,6 +852,38 @@ void KmonitorMetricsReporter::ReportInterval() {
         report_registry_metric(ctx_->cache_gc_inflight_delete_count_metrics.get(), "cache_gc.inflight_delete_count");
         report_registry_metric(ctx_->cache_gc_inflight_delete_age_ms_metrics.get(), "cache_gc.inflight_delete_age_ms");
         report_registry_metric(ctx_->cache_gc_round_duration_ms_metrics.get(), "cache_gc.round_duration_ms");
+        report_registry_metric(ctx_->cache_gc_event_report_intent_count_metrics.get(),
+                               "cache_gc.event_report_intent_count");
+        report_registry_metric(ctx_->cache_gc_event_report_intent_update_count_metrics.get(),
+                               "cache_gc.event_report_intent_update_count");
+        report_registry_metric(ctx_->cache_gc_event_report_active_instance_count_metrics.get(),
+                               "cache_gc.event_report_active_instance_count");
+        report_registry_metric(ctx_->cache_gc_event_report_oldest_intent_age_ms_metrics.get(),
+                               "cache_gc.event_report_oldest_intent_age_ms");
+        report_registry_metric(ctx_->cache_gc_event_report_recovery_pending_instance_count_metrics.get(),
+                               "cache_gc.event_report_recovery_pending_instance_count");
+        report_registry_metric(ctx_->cache_gc_event_report_recovery_observation_count_metrics.get(),
+                               "cache_gc.event_report_recovery_observation_count");
+        report_registry_metric(ctx_->cache_gc_event_report_recovery_complete_metrics.get(),
+                               "cache_gc.event_report_recovery_complete");
+        report_registry_metric(ctx_->cache_gc_event_report_scan_batch_count_metrics.get(),
+                               "cache_gc.event_report_scan_batch_count");
+        report_registry_metric(ctx_->cache_gc_event_report_scan_key_count_metrics.get(),
+                               "cache_gc.event_report_scan_key_count");
+        report_registry_metric(ctx_->cache_gc_event_report_scan_pass_count_metrics.get(),
+                               "cache_gc.event_report_scan_pass_count");
+        report_registry_metric(ctx_->cache_gc_event_report_delete_location_count_metrics.get(),
+                               "cache_gc.event_report_delete_location_count");
+        report_registry_metric(ctx_->cache_gc_event_report_retry_count_metrics.get(),
+                               "cache_gc.event_report_retry_count");
+        report_registry_metric(ctx_->cache_gc_event_report_last_pass_duration_ms_metrics.get(),
+                               "cache_gc.event_report_last_pass_duration_ms");
+        report_registry_metric(ctx_->cache_gc_event_report_last_action_duration_ms_metrics.get(),
+                               "cache_gc.event_report_last_action_duration_ms");
+        report_registry_metric(ctx_->cache_gc_event_report_last_action_shard_lock_wait_us_metrics.get(),
+                               "cache_gc.event_report_last_action_shard_lock_wait_us");
+        report_registry_metric(ctx_->cache_gc_event_report_sync_retry_batch_count_metrics.get(),
+                               "cache_gc.event_report_sync_retry_batch_count");
     } while (false);
 
     do {

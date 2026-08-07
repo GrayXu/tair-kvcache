@@ -51,6 +51,12 @@ public:
         }
     };
 
+    struct MaintenanceDeleteBatchResult {
+        ErrorCode ec = EC_OK;
+        MaintenanceLocationDeleteResults per_location_results;
+        int64_t shard_lock_wait_time_us = 0;
+    };
+
 public:
     MetaIndexer() = default;
     ~MetaIndexer();
@@ -77,6 +83,14 @@ public:
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
                                            bool refresh_cache_from_persistent = false) noexcept;
+    MaintenanceDeleteBatchResult CompareDeleteLocationsForMaintenance(
+        RequestContext *request_context,
+        const KeyVector &keys,
+        const LocationIdsPerKey &location_ids,
+        const std::vector<std::vector<std::string>> &expected_location_values) noexcept;
+    void CommitMaintenanceDeleteAccounting(
+        const std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> &location_usage,
+        const MaintenanceLocationDeleteResults &results) noexcept;
 
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
@@ -121,6 +135,7 @@ public:
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
 
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;

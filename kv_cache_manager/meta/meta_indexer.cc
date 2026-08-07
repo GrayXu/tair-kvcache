@@ -660,6 +660,115 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     return location_result;
 }
 
+MetaIndexer::MaintenanceDeleteBatchResult MetaIndexer::CompareDeleteLocationsForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdsPerKey &location_ids,
+    const std::vector<std::vector<std::string>> &expected_location_values) noexcept {
+    MaintenanceDeleteBatchResult result;
+    if (keys.size() != location_ids.size() || keys.size() != expected_location_values.size()) {
+        result.ec = EC_BADARGS;
+        return result;
+    }
+    result.per_location_results.resize(keys.size());
+    size_t total_targets = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i].size() != expected_location_values[i].size()) {
+            result.ec = EC_BADARGS;
+            result.per_location_results.clear();
+            return result;
+        }
+        result.per_location_results[i].resize(location_ids[i].size());
+        total_targets += location_ids[i].size();
+    }
+    if (keys.empty()) {
+        return result;
+    }
+
+    CacheLocationMapVector empty_locations;
+    PropertyMapVector empty_properties;
+    auto batches = MakeBatches(keys, location_ids, empty_locations, empty_properties);
+    size_t hard_error_count = 0;
+    RmwStats stats;
+    for (auto &batch : batches) {
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
+        std::vector<std::vector<std::string>> batch_expected_values;
+        batch_expected_values.reserve(batch.batch_indexs.size());
+        for (const int32_t global_index : batch.batch_indexs) {
+            batch_expected_values.push_back(expected_location_values[global_index]);
+        }
+        auto batch_results = backend_manager_->CompareDeleteLocationsForMaintenance(
+            request_context, batch.batch_keys, batch.batch_location_ids, batch_expected_values);
+        if (batch_results.size() != batch.batch_keys.size()) {
+            for (const int32_t global_index : batch.batch_indexs) {
+                auto &per_key = result.per_location_results[global_index];
+                for (auto &target_result : per_key) {
+                    target_result.ec = EC_ERROR;
+                    ++hard_error_count;
+                }
+            }
+            continue;
+        }
+        for (size_t i = 0; i < batch.batch_indexs.size(); ++i) {
+            const size_t global_index = static_cast<size_t>(batch.batch_indexs[i]);
+            if (batch_results[i].size() != location_ids[global_index].size()) {
+                auto &per_key = result.per_location_results[global_index];
+                for (auto &target_result : per_key) {
+                    target_result.ec = EC_ERROR;
+                    ++hard_error_count;
+                }
+                continue;
+            }
+            result.per_location_results[global_index] = std::move(batch_results[i]);
+            for (const auto &target_result : result.per_location_results[global_index]) {
+                if (target_result.ec != EC_OK && target_result.ec != EC_NOENT && target_result.ec != EC_MISMATCH) {
+                    ++hard_error_count;
+                }
+            }
+        }
+    }
+
+    result.shard_lock_wait_time_us = stats.lock_wait_time_us;
+    EmitRmwMetrics(request_context ? request_context->metrics_collector() : nullptr, stats, keys.size());
+    if (hard_error_count == total_targets && total_targets > 0) {
+        result.ec = EC_ERROR;
+    } else if (hard_error_count > 0) {
+        result.ec = EC_PARTIAL_OK;
+    }
+    return result;
+}
+
+void MetaIndexer::CommitMaintenanceDeleteAccounting(
+    const std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> &location_usage,
+    const MaintenanceLocationDeleteResults &results) noexcept {
+    if (location_usage.size() != results.size()) {
+        return;
+    }
+    int32_t reclaimed_key_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (location_usage[i].size() != results[i].size()) {
+            continue;
+        }
+        bool key_reclaimed = false;
+        for (size_t j = 0; j < results[i].size(); ++j) {
+            const auto &target_result = results[i][j];
+            if (target_result.ec != EC_OK && target_result.ec != EC_NOENT) {
+                continue;
+            }
+            if (target_result.removed_from_hot || target_result.removed_from_persistent) {
+                SubStorageUsageByType(location_usage[i][j].first, location_usage[i][j].second);
+            }
+            key_reclaimed = key_reclaimed || target_result.reclaimed_hot_key || target_result.reclaimed_persistent_key;
+        }
+        if (key_reclaimed) {
+            ++reclaimed_key_count;
+        }
+    }
+    if (reclaimed_key_count > 0) {
+        AdjustKeyCountMeta(-reclaimed_key_count);
+    }
+}
+
 MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {
     const auto &trace_id = request_context->trace_id();
@@ -892,6 +1001,8 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
+
+bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();

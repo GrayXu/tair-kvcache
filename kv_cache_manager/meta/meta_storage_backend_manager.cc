@@ -1,5 +1,6 @@
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <utility>
@@ -393,6 +394,282 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     }
 
     out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
+    return results;
+}
+
+MaintenanceLocationDeleteResults MetaStorageBackendManager::CompareDeleteLocationsForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdsPerKey &location_ids,
+    const std::vector<std::vector<std::string>> &expected_location_values) noexcept {
+    MaintenanceLocationDeleteResults results(keys.size());
+    if (keys.size() != location_ids.size() || keys.size() != expected_location_values.size()) {
+        return {};
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i].size() != expected_location_values[i].size()) {
+            return {};
+        }
+        results[i].resize(location_ids[i].size());
+    }
+    if (keys.empty()) {
+        return results;
+    }
+
+    // Capture layer-local key contents before mutation. Besides avoiding the
+    // ordinary touching read path, this lets us enqueue whole-key deletion
+    // immediately after deleting the last Location while the caller still
+    // owns the MetaIndexer shard lock.
+    LocationIdsPerKey persistent_location_ids;
+    const std::vector<ErrorCode> persistent_id_ecs =
+        persistent_backend_->GetLocationIdsForMaintenance(request_context, keys, persistent_location_ids);
+
+    LocationIdsPerKey hot_location_ids;
+    std::vector<ErrorCode> hot_id_ecs;
+    if (cache_backend_) {
+        hot_id_ecs = cache_backend_->GetLocationIdsForMaintenance(request_context, keys, hot_location_ids);
+    }
+
+    LocationsPerKey hot_locations;
+    std::vector<std::vector<ErrorCode>> hot_ecs;
+    if (cache_backend_) {
+        hot_ecs = cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, hot_locations);
+        if (hot_ecs.size() != keys.size() || hot_locations.size() != keys.size()) {
+            for (auto &per_key : results) {
+                for (auto &result : per_key) {
+                    result.ec = EC_ERROR;
+                }
+            }
+            return results;
+        }
+    }
+
+    LocationIdsPerKey persistent_target_ids(keys.size());
+    std::vector<std::vector<size_t>> persistent_target_indexes(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (cache_backend_ &&
+            (hot_ecs[i].size() != location_ids[i].size() || hot_locations[i].size() != location_ids[i].size())) {
+            for (auto &result : results[i]) {
+                result.ec = EC_ERROR;
+            }
+            continue;
+        }
+        for (size_t j = 0; j < location_ids[i].size(); ++j) {
+            if (!cache_backend_ || hot_ecs[i][j] == EC_NOENT) {
+                persistent_target_ids[i].push_back(location_ids[i][j]);
+                persistent_target_indexes[i].push_back(j);
+            }
+        }
+    }
+
+    LocationsPerKey persistent_locations;
+    const std::vector<std::vector<ErrorCode>> persistent_ecs = persistent_backend_->GetLocationsForMaintenance(
+        request_context, keys, persistent_target_ids, persistent_locations);
+    if (persistent_ecs.size() != keys.size() || persistent_locations.size() != keys.size()) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            for (const size_t j : persistent_target_indexes[i]) {
+                results[i][j].ec = EC_ERROR;
+            }
+        }
+        return results;
+    }
+
+    std::vector<std::vector<size_t>> authorized_indexes(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (persistent_ecs[i].size() != persistent_target_ids[i].size() ||
+            persistent_locations[i].size() != persistent_target_ids[i].size()) {
+            for (const size_t j : persistent_target_indexes[i]) {
+                results[i][j].ec = EC_ERROR;
+            }
+            continue;
+        }
+        size_t persistent_index = 0;
+        for (size_t j = 0; j < location_ids[i].size(); ++j) {
+            ErrorCode read_ec = EC_NOENT;
+            CacheLocationConstPtr location;
+            if (cache_backend_ && hot_ecs[i][j] != EC_NOENT) {
+                read_ec = hot_ecs[i][j];
+                location = hot_locations[i][j];
+            } else {
+                read_ec = persistent_ecs[i][persistent_index];
+                location = persistent_locations[i][persistent_index];
+                ++persistent_index;
+            }
+
+            if (read_ec == EC_NOENT) {
+                results[i][j].ec = EC_NOENT;
+                continue;
+            }
+            if (read_ec != EC_OK || !location) {
+                results[i][j].ec = read_ec == EC_OK ? EC_ERROR : read_ec;
+                continue;
+            }
+            if (location->ToJsonString() != expected_location_values[i][j]) {
+                results[i][j].ec = EC_MISMATCH;
+                continue;
+            }
+            authorized_indexes[i].push_back(j);
+        }
+    }
+
+    auto layer_has_no_unauthorized_locations = [&](size_t key_index,
+                                                   const std::vector<ErrorCode> &id_ecs,
+                                                   const LocationIdsPerKey &ids) {
+        if (id_ecs.size() != keys.size() || ids.size() != keys.size()) {
+            return false;
+        }
+        if (id_ecs[key_index] == EC_NOENT) {
+            return true;
+        }
+        if (id_ecs[key_index] != EC_OK) {
+            return false;
+        }
+        for (const auto &existing_id : ids[key_index]) {
+            const auto target_it =
+                std::find(location_ids[key_index].begin(), location_ids[key_index].end(), existing_id);
+            if (target_it == location_ids[key_index].end()) {
+                return false;
+            }
+            const size_t target_index = static_cast<size_t>(target_it - location_ids[key_index].begin());
+            if (std::find(authorized_indexes[key_index].begin(), authorized_indexes[key_index].end(), target_index) ==
+                authorized_indexes[key_index].end()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Whole-key reclamation must be a decision over both cache layers. A
+    // concurrent async mutation may already be visible in hot cache while its
+    // persistent write is still queued (or vice versa). Deleting an apparently
+    // last Location from only one layer must not erase a different Location
+    // that is visible in the other layer.
+    std::vector<bool> delete_whole_keys(keys.size(), false);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (authorized_indexes[i].empty()) {
+            continue;
+        }
+        const bool persistent_safe = layer_has_no_unauthorized_locations(i, persistent_id_ecs, persistent_location_ids);
+        const bool hot_safe = !cache_backend_ || layer_has_no_unauthorized_locations(i, hot_id_ecs, hot_location_ids);
+        delete_whole_keys[i] = persistent_safe && hot_safe;
+    }
+
+    auto target_existed_in_layer =
+        [&](size_t key_index, size_t target_index, const std::vector<ErrorCode> &id_ecs, const LocationIdsPerKey &ids) {
+            return id_ecs.size() == keys.size() && ids.size() == keys.size() && id_ecs[key_index] == EC_OK &&
+                   std::find(ids[key_index].begin(), ids[key_index].end(), location_ids[key_index][target_index]) !=
+                       ids[key_index].end();
+        };
+
+    struct LayerDeletePlan {
+        size_t key_index{0};
+        bool delete_whole_key{false};
+    };
+
+    auto execute_layer = [&](MetaStorageBackend *backend,
+                             const std::vector<ErrorCode> &layer_id_ecs,
+                             const LocationIdsPerKey &layer_ids,
+                             const std::vector<size_t> &eligible_key_indexes,
+                             bool persistent_layer,
+                             std::vector<bool> &out_accepted) {
+        std::vector<LayerDeletePlan> whole_plans;
+        std::vector<LayerDeletePlan> location_plans;
+        KeyVector whole_keys;
+        KeyVector location_keys;
+        LocationIdsPerKey ids_to_delete;
+        for (const size_t key_index : eligible_key_indexes) {
+            const bool delete_whole_key = delete_whole_keys[key_index];
+            if (delete_whole_key) {
+                whole_keys.push_back(keys[key_index]);
+                whole_plans.push_back({key_index, true});
+                continue;
+            }
+            location_keys.push_back(keys[key_index]);
+            location_plans.push_back({key_index, false});
+            auto &ids = ids_to_delete.emplace_back();
+            ids.reserve(authorized_indexes[key_index].size());
+            for (const size_t target_index : authorized_indexes[key_index]) {
+                ids.push_back(location_ids[key_index][target_index]);
+            }
+        }
+
+        std::vector<ErrorCode> whole_ecs;
+        if (!whole_keys.empty()) {
+            whole_ecs = backend->Delete(request_context, whole_keys);
+        }
+        if (whole_ecs.size() != whole_plans.size()) {
+            whole_ecs.assign(whole_plans.size(), EC_ERROR);
+        }
+        std::vector<ErrorCode> location_ecs;
+        if (!location_keys.empty()) {
+            location_ecs = backend->DeleteLocationsForMaintenance(request_context, location_keys, ids_to_delete);
+        }
+        if (location_ecs.size() != location_plans.size()) {
+            location_ecs.assign(location_plans.size(), EC_ERROR);
+        }
+
+        auto apply_result = [&](const LayerDeletePlan &plan, ErrorCode ec) {
+            const bool accepted = ec == EC_OK || ec == EC_NOENT;
+            out_accepted[plan.key_index] = accepted;
+            bool reclaim_recorded = false;
+            for (const size_t target_index : authorized_indexes[plan.key_index]) {
+                auto &target_result = results[plan.key_index][target_index];
+                if (!accepted) {
+                    target_result.ec = ec;
+                    continue;
+                }
+                target_result.ec = EC_OK;
+                const bool removed =
+                    ec == EC_OK && target_existed_in_layer(plan.key_index, target_index, layer_id_ecs, layer_ids);
+                if (persistent_layer) {
+                    target_result.removed_from_persistent = removed;
+                    if (plan.delete_whole_key && ec == EC_OK && !reclaim_recorded) {
+                        target_result.reclaimed_persistent_key = true;
+                        reclaim_recorded = true;
+                    }
+                } else {
+                    target_result.removed_from_hot = removed;
+                    if (plan.delete_whole_key && ec == EC_OK && !reclaim_recorded) {
+                        target_result.reclaimed_hot_key = true;
+                        reclaim_recorded = true;
+                    }
+                }
+            }
+        };
+        for (size_t i = 0; i < whole_plans.size(); ++i) {
+            apply_result(whole_plans[i], whole_ecs[i]);
+        }
+        for (size_t i = 0; i < location_plans.size(); ++i) {
+            apply_result(location_plans[i], location_ecs[i]);
+        }
+    };
+
+    std::vector<size_t> persistent_eligible_keys;
+    persistent_eligible_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!authorized_indexes[i].empty()) {
+            persistent_eligible_keys.push_back(i);
+        }
+    }
+    std::vector<bool> persistent_accepted(keys.size(), false);
+    execute_layer(persistent_backend_.get(),
+                  persistent_id_ecs,
+                  persistent_location_ids,
+                  persistent_eligible_keys,
+                  true,
+                  persistent_accepted);
+
+    if (cache_backend_) {
+        std::vector<size_t> hot_eligible_keys;
+        hot_eligible_keys.reserve(persistent_eligible_keys.size());
+        for (const size_t key_index : persistent_eligible_keys) {
+            if (persistent_accepted[key_index]) {
+                hot_eligible_keys.push_back(key_index);
+            }
+        }
+        std::vector<bool> hot_accepted(keys.size(), false);
+        execute_layer(cache_backend_.get(), hot_id_ecs, hot_location_ids, hot_eligible_keys, false, hot_accepted);
+    }
     return results;
 }
 
@@ -838,6 +1115,13 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
         return true;
     }
     return persistent_backend_->Sync(keys);
+}
+
+bool MetaStorageBackendManager::SyncAll() noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->SyncAll();
 }
 
 MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {

@@ -17,7 +17,11 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/manager/event_report_cleanup_util.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
@@ -47,6 +51,17 @@ constexpr const char *kOrphanWritingReason = "orphan_writing";
 constexpr const char *kStorageMissingReason = "storage_missing";
 // DataStorageManager keeps a shared registry lock while invoking MightExist().
 constexpr size_t kMightExistProbeBatchSize = 512;
+constexpr int64_t kMaxEventReportRetryBackoffMs = 60000;
+
+int64_t CappedEventReportRetryBackoffMs(int64_t scan_interval_ms, uint32_t consecutive_failures) {
+    const int64_t base_ms = std::min(scan_interval_ms, kMaxEventReportRetryBackoffMs);
+    const uint32_t shift = std::min<uint32_t>(consecutive_failures > 0 ? consecutive_failures - 1 : 0, 16);
+    const int64_t multiplier = int64_t{1} << shift;
+    if (base_ms >= kMaxEventReportRetryBackoffMs / multiplier) {
+        return kMaxEventReportRetryBackoffMs;
+    }
+    return base_ms * multiplier;
+}
 
 using CandidateKey = std::pair<KeyType, std::string>;
 using StorageProbeKey = std::tuple<std::string, DataStorageType>;
@@ -78,6 +93,7 @@ struct StorageProbeBatch {
 CacheGarbageCollector::CacheGarbageCollector(Config config,
                                              std::shared_ptr<RegistryManager> registry_manager,
                                              std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
+                                             std::shared_ptr<MetaSearcherManager> meta_searcher_manager,
                                              std::shared_ptr<DataStorageManager> data_storage_manager,
                                              std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor,
                                              std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -85,6 +101,7 @@ CacheGarbageCollector::CacheGarbageCollector(Config config,
     : config_(std::move(config))
     , registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
+    , meta_searcher_manager_(std::move(meta_searcher_manager))
     , data_storage_manager_(std::move(data_storage_manager))
     , schedule_plan_executor_(std::move(schedule_plan_executor))
     , metrics_registry_(std::move(metrics_registry))
@@ -94,12 +111,20 @@ CacheGarbageCollector::CacheGarbageCollector(Config config,
 CacheGarbageCollector::~CacheGarbageCollector() { Stop(); }
 
 ErrorCode CacheGarbageCollector::Validate() const noexcept {
+    if (config_.event_report_cleanup_enabled && !config_.enabled) {
+        KVCM_LOG_ERROR("event report cache gc cleanup requires cache gc enabled");
+        return EC_CONFIG_ERROR;
+    }
     if (!config_.enabled) {
         return EC_OK;
     }
     if (!registry_manager_ || !meta_indexer_manager_ || !data_storage_manager_ || !schedule_plan_executor_ ||
         !metrics_registry_ || !migration_manager_) {
         KVCM_LOG_ERROR("cache gc enabled with missing dependency");
+        return EC_CONFIG_ERROR;
+    }
+    if (config_.event_report_cleanup_enabled && !meta_searcher_manager_) {
+        KVCM_LOG_ERROR("event report cache gc cleanup enabled with missing MetaSearcherManager");
         return EC_CONFIG_ERROR;
     }
     if (config_.scan_interval_ms <= 0 || config_.round_pause_ms <= 0 || config_.scan_batch_size == 0 ||
@@ -157,10 +182,12 @@ ErrorCode CacheGarbageCollector::Start() noexcept {
         RegisterMetrics();
         ResetWorkerState();
         stop_requested_.store(false, std::memory_order_release);
+        event_report_intent_admission_open_.store(config_.event_report_cleanup_enabled, std::memory_order_release);
         worker_ = LoopThread::CreateLoopThread(
             [this]() { RunOneTick(); }, config_.scan_interval_ms * 1000, "CacheGarbageCollector", true);
         if (!worker_) {
             stop_requested_.store(true, std::memory_order_release);
+            event_report_intent_admission_open_.store(false, std::memory_order_release);
             KVCM_LOG_ERROR("start cache gc worker failed: LoopThread creation returned null");
             return EC_ERROR;
         }
@@ -169,12 +196,14 @@ ErrorCode CacheGarbageCollector::Start() noexcept {
         worker_.reset();
         running_ = false;
         stop_requested_.store(true, std::memory_order_release);
+        event_report_intent_admission_open_.store(false, std::memory_order_release);
         KVCM_LOG_ERROR("start cache gc worker failed: %s", e.what());
         return EC_ERROR;
     } catch (...) {
         worker_.reset();
         running_ = false;
         stop_requested_.store(true, std::memory_order_release);
+        event_report_intent_admission_open_.store(false, std::memory_order_release);
         KVCM_LOG_ERROR("start cache gc worker failed with unknown exception");
         return EC_ERROR;
     }
@@ -183,6 +212,7 @@ ErrorCode CacheGarbageCollector::Start() noexcept {
 }
 
 void CacheGarbageCollector::RequestStop() noexcept {
+    event_report_intent_admission_open_.store(false, std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (worker_) {
@@ -193,6 +223,7 @@ void CacheGarbageCollector::RequestStop() noexcept {
 }
 
 void CacheGarbageCollector::Join() noexcept {
+    event_report_intent_admission_open_.store(false, std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (worker_) {
@@ -204,6 +235,14 @@ void CacheGarbageCollector::Join() noexcept {
     // MetaIndexer/DataStorage dependencies alive across leader cleanup; a post-CAS failure may remain CLS_DELETING.
     inflight_deletes_.clear();
     pending_locations_.clear();
+    {
+        std::lock_guard<std::mutex> intent_lock(event_report_intent_mutex_);
+        event_report_intents_.clear();
+        recovery_observations_.clear();
+    }
+    event_report_scan_states_.clear();
+    recovery_discovery_instances_.clear();
+    event_report_retry_batches_.clear();
     METRICS_(cache_gc, inflight_delete_count) = 0;
     METRICS_(cache_gc, inflight_delete_age_ms) = 0;
     running_ = false;
@@ -219,6 +258,177 @@ bool CacheGarbageCollector::IsRunning() const noexcept {
     return running_;
 }
 
+bool CacheGarbageCollector::RegisterSnapshotCleanupIntent(const std::string &instance_id,
+                                                          DataStorageType storage_type,
+                                                          const std::string &host_ip_port,
+                                                          const std::string &committed_version,
+                                                          uint64_t snapshot_attempt_epoch,
+                                                          uint64_t lifecycle_generation,
+                                                          const std::shared_ptr<EventReportBackend> &backend) noexcept {
+    try {
+        if (!event_report_intent_admission_open_.load(std::memory_order_acquire) || instance_id.empty() ||
+            host_ip_port.empty() || committed_version.empty() || !backend ||
+            backend->GetStorageType() != storage_type) {
+            return false;
+        }
+
+        EventReportBackend::LifecycleMutationLease lease;
+        const auto lease_result =
+            backend->AcquireActiveLifecycleCleanupLease({instance_id, host_ip_port}, lifecycle_generation, lease);
+        if (lease_result != EventReportBackend::CleanupLeaseAcquireResult::kAcquired ||
+            backend->GetSnapshotVersion({instance_id, host_ip_port}) != committed_version ||
+            backend->GetSnapshotAttemptEpoch({instance_id, host_ip_port}) != snapshot_attempt_epoch) {
+            return false;
+        }
+
+        std::string update_result = "created";
+        {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            if (!event_report_intent_admission_open_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            const EventReportIntentKey key{instance_id, storage_type, host_ip_port};
+            auto it = event_report_intents_.find(key);
+            if (it != event_report_intents_.end()) {
+                const bool same_lifecycle = it->second.lifecycle_generation == lifecycle_generation;
+                if ((it->second.type == EventReportIntentType::kDownHost ||
+                     it->second.type == EventReportIntentType::kRecoveryAbsentHost) &&
+                    same_lifecycle) {
+                    update_result = "merged";
+                } else if (it->second.type == EventReportIntentType::kStaleSnapshot &&
+                           it->second.committed_version == committed_version &&
+                           it->second.snapshot_attempt_epoch == snapshot_attempt_epoch && same_lifecycle) {
+                    update_result = "merged";
+                } else {
+                    it->second = EventReportCleanupIntent{
+                        .type = EventReportIntentType::kStaleSnapshot,
+                        .revision = next_event_report_intent_revision_++,
+                        .created_at = Clock::now(),
+                        .backend = backend,
+                        .committed_version = committed_version,
+                        .snapshot_attempt_epoch = snapshot_attempt_epoch,
+                        .lifecycle_generation = lifecycle_generation,
+                    };
+                    update_result = "replaced";
+                }
+            } else {
+                event_report_intents_.emplace(key,
+                                              EventReportCleanupIntent{
+                                                  .type = EventReportIntentType::kStaleSnapshot,
+                                                  .revision = next_event_report_intent_revision_++,
+                                                  .created_at = Clock::now(),
+                                                  .backend = backend,
+                                                  .committed_version = committed_version,
+                                                  .snapshot_attempt_epoch = snapshot_attempt_epoch,
+                                                  .lifecycle_generation = lifecycle_generation,
+                                              });
+            }
+        }
+        RecordEventReportIntentUpdate(EventReportIntentType::kStaleSnapshot, update_result);
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("register snapshot cleanup intent failed, instance[%s] host[%s] error[%s]",
+                       instance_id.c_str(),
+                       host_ip_port.c_str(),
+                       e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("register snapshot cleanup intent failed, instance[%s] host[%s] unknown error",
+                       instance_id.c_str(),
+                       host_ip_port.c_str());
+    }
+    return false;
+}
+
+bool CacheGarbageCollector::RegisterHostCleanupIntent(const std::string &instance_id,
+                                                      DataStorageType storage_type,
+                                                      const std::string &host_ip_port,
+                                                      uint64_t lifecycle_generation,
+                                                      const std::shared_ptr<EventReportBackend> &backend) noexcept {
+    try {
+        if (!event_report_intent_admission_open_.load(std::memory_order_acquire) || instance_id.empty() ||
+            host_ip_port.empty() || !backend || backend->GetStorageType() != storage_type) {
+            return false;
+        }
+
+        std::string update_result = "created";
+        {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            if (!event_report_intent_admission_open_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            const EventReportIntentKey key{instance_id, storage_type, host_ip_port};
+            auto it = event_report_intents_.find(key);
+            if (it != event_report_intents_.end() && it->second.lifecycle_generation > lifecycle_generation) {
+                // Event callbacks can finish out of order. Never let cleanup
+                // from an older Reporter lifecycle replace a newer intent.
+                update_result = "stale_ignored";
+            } else if (it != event_report_intents_.end() && it->second.type == EventReportIntentType::kDownHost &&
+                       it->second.lifecycle_generation == lifecycle_generation) {
+                update_result = "merged";
+            } else {
+                EventReportCleanupIntent intent{
+                    .type = EventReportIntentType::kDownHost,
+                    .revision = next_event_report_intent_revision_++,
+                    .created_at = Clock::now(),
+                    .backend = backend,
+                    .lifecycle_generation = lifecycle_generation,
+                };
+                if (it == event_report_intents_.end()) {
+                    event_report_intents_.emplace(key, std::move(intent));
+                } else {
+                    it->second = std::move(intent);
+                    update_result = "replaced";
+                }
+            }
+            recovery_observations_.erase(key);
+        }
+        RecordEventReportIntentUpdate(EventReportIntentType::kDownHost, update_result);
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("register host cleanup intent failed, instance[%s] host[%s] error[%s]",
+                       instance_id.c_str(),
+                       host_ip_port.c_str(),
+                       e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("register host cleanup intent failed, instance[%s] host[%s] unknown error",
+                       instance_id.c_str(),
+                       host_ip_port.c_str());
+    }
+    return false;
+}
+
+void CacheGarbageCollector::CancelHostCleanupIntent(const std::string &instance_id,
+                                                    DataStorageType storage_type,
+                                                    const std::string &host_ip_port) noexcept {
+    try {
+        bool canceled = false;
+        EventReportIntentType canceled_type = EventReportIntentType::kDownHost;
+        {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            const EventReportIntentKey key{instance_id, storage_type, host_ip_port};
+            recovery_observations_.erase(key);
+            const auto it = event_report_intents_.find(key);
+            if (it != event_report_intents_.end() && it->second.type != EventReportIntentType::kStaleSnapshot) {
+                canceled_type = it->second.type;
+                event_report_intents_.erase(it);
+                canceled = true;
+            }
+        }
+        if (canceled) {
+            RecordEventReportIntentUpdate(canceled_type, "canceled");
+        }
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("cancel host cleanup intent failed, instance[%s] host[%s] error[%s]",
+                       instance_id.c_str(),
+                       host_ip_port.c_str(),
+                       e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("cancel host cleanup intent failed, instance[%s] host[%s] unknown error",
+                       instance_id.c_str(),
+                       host_ip_port.c_str());
+    }
+}
+
 void CacheGarbageCollector::ResetWorkerState() noexcept {
     instances_.clear();
     instance_index_ = 0;
@@ -228,6 +438,21 @@ void CacheGarbageCollector::ResetWorkerState() noexcept {
     round_context_.reset();
     inflight_deletes_.clear();
     pending_locations_.clear();
+    {
+        std::lock_guard<std::mutex> intent_lock(event_report_intent_mutex_);
+        event_report_intents_.clear();
+        recovery_observations_.clear();
+        next_event_report_intent_revision_ = 1;
+    }
+    event_report_scan_states_.clear();
+    recovery_discovery_instances_.clear();
+    recovery_final_snapshot_seen_ = false;
+    recovery_discovery_complete_ = !config_.event_report_cleanup_enabled;
+    recovery_list_failures_ = 0;
+    recovery_next_retry_at_ = Clock::time_point{};
+    last_event_report_instance_.clear();
+    consecutive_event_report_ticks_ = 0;
+    event_report_retry_batches_.clear();
     METRICS_(cache_gc, inflight_delete_count) = 0;
     METRICS_(cache_gc, inflight_delete_age_ms) = 0;
     METRICS_(cache_gc, round_duration_ms) = 0;
@@ -239,6 +464,18 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             return;
         }
         PollInflightDeletes();
+        const auto tick_now = Clock::now();
+        if (config_.event_report_cleanup_enabled) {
+            const bool regular_runnable = inflight_deletes_.size() < config_.max_inflight_delete_requests &&
+                                          (!next_round_at_.has_value() || tick_now >= next_round_at_.value());
+            if (!regular_runnable || consecutive_event_report_ticks_ < 4) {
+                if (RunEventReportTick()) {
+                    ++consecutive_event_report_ticks_;
+                    return;
+                }
+            }
+            consecutive_event_report_ticks_ = 0;
+        }
         if (inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
             return;
         }
@@ -388,6 +625,886 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         RecordOperationError("tick_exception");
         KVCM_LOG_ERROR("cache gc tick threw unknown exception");
     }
+}
+
+bool CacheGarbageCollector::RefreshRecoveryDiscoverySnapshot() {
+    if (recovery_discovery_complete_ || stop_requested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (recovery_final_snapshot_seen_) {
+        recovery_discovery_complete_ = std::all_of(recovery_discovery_instances_.begin(),
+                                                   recovery_discovery_instances_.end(),
+                                                   [](const auto &entry) { return entry.second; });
+        return !recovery_discovery_complete_;
+    }
+    const auto now = Clock::now();
+    if (recovery_next_retry_at_ != Clock::time_point{} && now < recovery_next_retry_at_) {
+        return false;
+    }
+    auto schedule_retry = [this](const std::string &stage) {
+        ++recovery_list_failures_;
+        const int64_t backoff_ms = CappedEventReportRetryBackoffMs(config_.scan_interval_ms, recovery_list_failures_);
+        recovery_next_retry_at_ = Clock::now() + std::chrono::milliseconds(backoff_ms);
+        RecordEventReportRetry(stage);
+    };
+    RequestContext context("cache_gc_event_report_recovery_list");
+    auto [group_ec, groups] = registry_manager_->ListInstanceGroup(&context);
+    if (group_ec != EC_OK) {
+        schedule_retry("recovery_list_groups");
+        return false;
+    }
+
+    std::set<std::string> snapshot_instances;
+    for (const auto &group : groups) {
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!group || group->name().empty()) {
+            schedule_retry("recovery_snapshot");
+            return false;
+        }
+        if (group->event_report_storage_candidates().empty()) {
+            continue;
+        }
+        auto [instance_ec, instances] = registry_manager_->ListInstanceInfo(&context, group->name());
+        if (instance_ec != EC_OK) {
+            schedule_retry("recovery_list_instances");
+            return false;
+        }
+        for (const auto &instance : instances) {
+            if (!instance || instance->instance_id().empty()) {
+                schedule_retry("recovery_snapshot");
+                return false;
+            }
+            snapshot_instances.insert(instance->instance_id());
+            recovery_discovery_instances_.try_emplace(instance->instance_id(), false);
+        }
+    }
+
+    recovery_list_failures_ = 0;
+    recovery_next_retry_at_ = Clock::time_point{};
+
+    if (registry_manager_->IsRecoverComplete()) {
+        recovery_final_snapshot_seen_ = true;
+        for (auto it = recovery_discovery_instances_.begin(); it != recovery_discovery_instances_.end();) {
+            if (snapshot_instances.count(it->first) == 0) {
+                event_report_scan_states_.erase(it->first);
+                it = recovery_discovery_instances_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (recovery_final_snapshot_seen_ && std::all_of(recovery_discovery_instances_.begin(),
+                                                     recovery_discovery_instances_.end(),
+                                                     [](const auto &entry) { return entry.second; })) {
+        recovery_discovery_complete_ = true;
+    }
+    return !recovery_discovery_complete_;
+}
+
+void CacheGarbageCollector::PromoteExpiredRecoveryObservations() {
+    struct ExpiredObservation {
+        EventReportIntentKey key;
+        RecoveryObservation observation;
+    };
+    std::vector<ExpiredObservation> expired;
+    std::vector<EventReportIntentKey> expired_backends;
+    const auto now = Clock::now();
+    {
+        std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+        for (const auto &[key, observation] : recovery_observations_) {
+            const auto backend = observation.backend.lock();
+            if (!backend) {
+                expired_backends.push_back(key);
+                continue;
+            }
+            const int64_t heartbeat_timeout_ms = std::max<int64_t>(0, backend->GetHeartbeatTimeoutMs());
+            const int64_t cleanup_grace_ms = std::max<int64_t>(0, backend->GetCleanupGraceMs());
+            const int64_t wait_ms = heartbeat_timeout_ms > std::numeric_limits<int64_t>::max() - cleanup_grace_ms
+                                        ? std::numeric_limits<int64_t>::max()
+                                        : heartbeat_timeout_ms + cleanup_grace_ms;
+            const int64_t elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - observation.first_seen_absent).count();
+            if (elapsed_ms >= wait_ms) {
+                expired.push_back({key, observation});
+            }
+        }
+        for (const auto &key : expired_backends) {
+            recovery_observations_.erase(key);
+        }
+    }
+
+    for (const auto &entry : expired) {
+        auto backend = entry.observation.backend.lock();
+        if (!backend) {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            recovery_observations_.erase(entry.key);
+            continue;
+        }
+        const auto current_backend = LookupEventReportBackend(entry.key.instance_id, entry.key.storage_type);
+        if (!current_backend || current_backend.get() != backend.get()) {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            recovery_observations_.erase(entry.key);
+            continue;
+        }
+        if (!backend->Available()) {
+            continue;
+        }
+        EventReportBackend::LifecycleMutationLease lease;
+        uint64_t generation = 0;
+        const auto lease_result = backend->AcquireAbsentReporterCleanupLease(
+            {entry.key.instance_id, entry.key.host_ip_port}, generation, lease);
+        if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kBusy) {
+            RecordEventReportRetry("recovery_absent_lease_busy");
+            continue;
+        }
+        std::string update_result = "created";
+        bool updated = false;
+        {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            const auto observation_it = recovery_observations_.find(entry.key);
+            if (observation_it == recovery_observations_.end() ||
+                observation_it->second.first_seen_absent != entry.observation.first_seen_absent) {
+                continue;
+            }
+            if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kStale) {
+                recovery_observations_.erase(observation_it);
+                continue;
+            }
+            auto intent_it = event_report_intents_.find(entry.key);
+            if (intent_it != event_report_intents_.end() &&
+                intent_it->second.type == EventReportIntentType::kRecoveryAbsentHost &&
+                intent_it->second.lifecycle_generation == generation) {
+                update_result = "merged";
+            } else {
+                EventReportCleanupIntent intent{
+                    .type = EventReportIntentType::kRecoveryAbsentHost,
+                    .revision = next_event_report_intent_revision_++,
+                    .created_at = Clock::now(),
+                    .backend = backend,
+                    .lifecycle_generation = generation,
+                };
+                if (intent_it == event_report_intents_.end()) {
+                    event_report_intents_.emplace(entry.key, std::move(intent));
+                } else {
+                    intent_it->second = std::move(intent);
+                    update_result = "replaced";
+                }
+            }
+            recovery_observations_.erase(observation_it);
+            updated = true;
+        }
+        if (updated) {
+            RecordEventReportIntentUpdate(EventReportIntentType::kRecoveryAbsentHost, update_result);
+        }
+    }
+}
+
+bool CacheGarbageCollector::RunEventReportTick() {
+    if (!event_report_intent_admission_open_.load(std::memory_order_acquire) ||
+        stop_requested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    PromoteExpiredRecoveryObservations();
+    RefreshRecoveryDiscoverySnapshot();
+    std::set<std::string> active_instances;
+    {
+        std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+        for (const auto &[key, _] : event_report_intents_) {
+            active_instances.insert(key.instance_id);
+        }
+    }
+    for (const auto &[instance_id, done] : recovery_discovery_instances_) {
+        if (!done) {
+            active_instances.insert(instance_id);
+        }
+    }
+    for (const auto &[instance_id, _] : event_report_retry_batches_) {
+        active_instances.insert(instance_id);
+    }
+    if (active_instances.empty()) {
+        UpdateEventReportMetrics();
+        return false;
+    }
+
+    std::vector<std::string> ordered(active_instances.begin(), active_instances.end());
+    auto start_it = last_event_report_instance_.empty()
+                        ? ordered.begin()
+                        : std::upper_bound(ordered.begin(), ordered.end(), last_event_report_instance_);
+    const auto now = Clock::now();
+    for (size_t attempt = 0; attempt < ordered.size(); ++attempt) {
+        if (start_it == ordered.end()) {
+            start_it = ordered.begin();
+        }
+        const std::string instance_id = *start_it++;
+        auto retry_it = event_report_retry_batches_.find(instance_id);
+        if (retry_it != event_report_retry_batches_.end()) {
+            auto &retry = retry_it->second;
+            if (retry.next_retry_at != Clock::time_point{} && now < retry.next_retry_at) {
+                continue;
+            }
+            last_event_report_instance_ = instance_id;
+            bool revisit_required = false;
+            MaintenanceLocationDeleteResults retry_results;
+            const MaintenanceLocationDeleteResults *prior_results =
+                retry.prior_results.empty() ? nullptr : &retry.prior_results;
+            const bool completed = ExecuteEventReportDeleteBatch(
+                instance_id, retry.pass_id, retry.targets, prior_results, retry_results, revisit_required);
+            auto state_it = event_report_scan_states_.find(instance_id);
+            if (state_it != event_report_scan_states_.end()) {
+                state_it->second.revisit_required = state_it->second.revisit_required || revisit_required;
+            }
+            if (completed) {
+                event_report_retry_batches_.erase(retry_it);
+                if (state_it != event_report_scan_states_.end() && state_it->second.context &&
+                    state_it->second.cursor == SCAN_BASE_CURSOR) {
+                    CompleteEventReportPass(instance_id, state_it->second);
+                }
+            } else {
+                if (!retry_results.empty()) {
+                    retry.prior_results = std::move(retry_results);
+                }
+                ++retry.consecutive_failures;
+                const int64_t backoff_ms =
+                    CappedEventReportRetryBackoffMs(config_.scan_interval_ms, retry.consecutive_failures);
+                retry.next_retry_at = Clock::now() + std::chrono::milliseconds(backoff_ms);
+                RecordEventReportRetry("action");
+            }
+            UpdateEventReportMetrics();
+            return true;
+        }
+        auto &state = event_report_scan_states_[instance_id];
+        if (state.next_retry_at != Clock::time_point{} && now < state.next_retry_at) {
+            continue;
+        }
+        last_event_report_instance_ = instance_id;
+        if (!state.context && !BeginEventReportPass(instance_id, state)) {
+            UpdateEventReportMetrics();
+            return true;
+        }
+        if (state.context) {
+            RunEventReportInstanceBatch(instance_id, state);
+            UpdateEventReportMetrics();
+            return true;
+        }
+    }
+    UpdateEventReportMetrics();
+    return false;
+}
+
+bool CacheGarbageCollector::BeginEventReportPass(const std::string &instance_id, EventReportScanState &state) {
+    state.pass_intents.clear();
+    {
+        std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+        for (const auto &[key, intent] : event_report_intents_) {
+            if (key.instance_id == instance_id) {
+                state.pass_intents.emplace(key, intent);
+            }
+        }
+    }
+    const auto discovery_it = recovery_discovery_instances_.find(instance_id);
+    state.discovery_pass = discovery_it != recovery_discovery_instances_.end() && !discovery_it->second;
+    if (state.pass_intents.empty() && !state.discovery_pass) {
+        return false;
+    }
+
+    for (auto it = state.pass_intents.begin(); it != state.pass_intents.end();) {
+        const auto &key = it->first;
+        const auto &intent = it->second;
+        auto backend = intent.backend.lock();
+        const auto current_backend = LookupEventReportBackend(key.instance_id, key.storage_type);
+        if (backend && !current_backend && !registry_manager_->IsRecoverComplete()) {
+            FailEventReportPass(instance_id, state, "backend_missing_during_recovery");
+            return false;
+        }
+        if (!backend || !current_backend || current_backend.get() != backend.get()) {
+            {
+                std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+                const auto current = event_report_intents_.find(key);
+                if (current != event_report_intents_.end() && current->second.revision == intent.revision) {
+                    event_report_intents_.erase(current);
+                }
+            }
+            RecordEventReportIntentUpdate(intent.type, "canceled");
+            it = state.pass_intents.erase(it);
+            continue;
+        }
+        if (!backend->Available()) {
+            FailEventReportPass(instance_id, state, "backend_unavailable");
+            return false;
+        }
+        if (intent.type == EventReportIntentType::kDownHost) {
+            // Liveness publishes the intent before its generation-checked unregister. Do not put the SyncAll
+            // barrier ahead of an old-lifecycle mutation that is still holding a shared lease: first prove that
+            // unregister has completed, release this short preflight lease, and only then flush the mutation queues.
+            EventReportBackend::LifecycleMutationLease preflight_lease;
+            const auto lease_result = backend->AcquireDownLifecycleCleanupLease(
+                {key.instance_id, key.host_ip_port}, intent.lifecycle_generation, preflight_lease);
+            if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kBusy) {
+                FailEventReportPass(instance_id, state, "lifecycle_preflight_busy");
+                return false;
+            }
+            if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kStale) {
+                {
+                    std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+                    const auto current = event_report_intents_.find(key);
+                    if (current != event_report_intents_.end() && current->second.revision == intent.revision) {
+                        event_report_intents_.erase(current);
+                    }
+                }
+                RecordEventReportIntentUpdate(intent.type, "canceled");
+                it = state.pass_intents.erase(it);
+                continue;
+            }
+        }
+        ++it;
+    }
+    if (state.pass_intents.empty() && !state.discovery_pass) {
+        return false;
+    }
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher || !meta_searcher->SyncAllForMaintenance()) {
+        FailEventReportPass(instance_id, state, meta_searcher ? "sync_all" : "searcher_missing");
+        return false;
+    }
+    ++state.pass_id;
+    state.cursor = SCAN_BASE_CURSOR;
+    state.sync_barrier_complete = true;
+    state.revisit_required = false;
+    state.pass_started_at = Clock::now();
+    state.context = std::make_shared<RequestContext>("cache_gc_event_report_pass_" + std::to_string(state.pass_id));
+    state.next_retry_at = Clock::time_point{};
+    return true;
+}
+
+bool CacheGarbageCollector::RunEventReportInstanceBatch(const std::string &instance_id, EventReportScanState &state) {
+    auto indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+    if (!indexer) {
+        FailEventReportPass(instance_id, state, "indexer_missing");
+        return false;
+    }
+
+    MaintenanceScanBatch batch;
+    const std::string scan_cursor = state.cursor;
+    const ErrorCode scan_ec =
+        indexer->ScanLocationsForMaintenance(state.context.get(), scan_cursor, config_.scan_batch_size, batch);
+    if (scan_ec != EC_OK || batch.keys.size() != batch.locations.size() ||
+        batch.keys.size() != batch.location_results.size()) {
+        FailEventReportPass(instance_id, state, scan_ec == EC_OK ? "scan_shape" : "scan");
+        return false;
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    try {
+        ++metrics_registry_->GetCounter("cache_gc.event_report_scan_batch_count");
+        metrics_registry_->GetCounter("cache_gc.event_report_scan_key_count") += batch.keys.size();
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report scan metrics"); }
+
+    bool truncated = false;
+    bool retry_required = false;
+    auto targets = BuildEventReportDeleteTargets(
+        instance_id, batch, state.pass_intents, state.discovery_pass, truncated, retry_required);
+    state.revisit_required = state.revisit_required || truncated;
+    if (retry_required) {
+        FailEventReportPass(instance_id, state, "discovery_backend");
+        return false;
+    }
+    state.cursor = batch.next_cursor;
+
+    if (!targets.empty()) {
+        MaintenanceLocationDeleteResults delete_results;
+        bool action_revisit = false;
+        const bool completed =
+            ExecuteEventReportDeleteBatch(instance_id, state.pass_id, targets, nullptr, delete_results, action_revisit);
+        state.revisit_required = state.revisit_required || action_revisit;
+        if (!completed) {
+            event_report_retry_batches_[instance_id] = EventReportRetryBatch{
+                .instance_id = instance_id,
+                .pass_id = state.pass_id,
+                .targets = std::move(targets),
+                .prior_results = std::move(delete_results),
+                .consecutive_failures = 1,
+                .next_retry_at = Clock::now() + std::chrono::milliseconds(config_.scan_interval_ms),
+            };
+            RecordEventReportRetry("action");
+            return true;
+        }
+    }
+
+    state.consecutive_failures = 0;
+    state.next_retry_at = Clock::time_point{};
+
+    if (state.cursor == SCAN_BASE_CURSOR) {
+        CompleteEventReportPass(instance_id, state);
+    }
+    return true;
+}
+
+std::vector<CacheGarbageCollector::EventReportDeleteTarget> CacheGarbageCollector::BuildEventReportDeleteTargets(
+    const std::string &instance_id,
+    const MaintenanceScanBatch &batch,
+    const std::map<EventReportIntentKey, EventReportCleanupIntent> &pass_intents,
+    bool discovery_pass,
+    bool &out_truncated,
+    bool &out_retry_required) {
+    out_truncated = false;
+    out_retry_required = false;
+    std::map<CandidateKey, EventReportDeleteTarget> candidates;
+    auto priority = [](EventReportIntentType type) {
+        switch (type) {
+        case EventReportIntentType::kDownHost:
+            return 3;
+        case EventReportIntentType::kRecoveryAbsentHost:
+            return 2;
+        case EventReportIntentType::kStaleSnapshot:
+            return 1;
+        }
+        return 0;
+    };
+
+    for (size_t i = 0; i < batch.keys.size(); ++i) {
+        if (batch.location_results[i] != EC_OK) {
+            if (batch.location_results[i] != EC_NOENT) {
+                out_retry_required = true;
+            }
+            continue;
+        }
+        for (const auto &[location_id, location] : batch.locations[i]) {
+            if (!location || location_id.empty() || location->id() != location_id ||
+                !IsEventReportStorageType(location->type())) {
+                continue;
+            }
+
+            if (discovery_pass) {
+                auto backend = LookupEventReportBackend(instance_id, location->type());
+                if (!backend) {
+                    if (!registry_manager_->IsRecoverComplete()) {
+                        out_retry_required = true;
+                    }
+                } else if (!backend->Available()) {
+                    out_retry_required = true;
+                } else {
+                    std::string medium;
+                    std::string host;
+                    if (backend->ParseLocationId(location_id, medium, host)) {
+                        const EventReportIntentKey key{instance_id, location->type(), host};
+                        if (backend->IsNodeRegistered(instance_id, host)) {
+                            CancelHostCleanupIntent(instance_id, location->type(), host);
+                        } else {
+                            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+                            recovery_observations_.try_emplace(
+                                key, RecoveryObservation{Clock::now(), std::weak_ptr<EventReportBackend>(backend)});
+                        }
+                    }
+                }
+            }
+
+            for (const auto &[intent_key, intent] : pass_intents) {
+                if (intent_key.instance_id != instance_id || intent_key.storage_type != location->type()) {
+                    continue;
+                }
+                auto backend = intent.backend.lock();
+                if (!backend || !backend->Available()) {
+                    continue;
+                }
+                std::string medium;
+                std::string reporter_host;
+                if (!backend->ParseLocationId(location_id, medium, reporter_host) ||
+                    reporter_host != intent_key.host_ip_port) {
+                    continue;
+                }
+
+                bool should_delete = intent.type != EventReportIntentType::kStaleSnapshot;
+                if (intent.type == EventReportIntentType::kStaleSnapshot) {
+                    const ReporterSnapshotKey reporter_key{instance_id, reporter_host};
+                    should_delete =
+                        backend->GetSnapshotVersion(reporter_key) == intent.committed_version &&
+                        backend->GetSnapshotAttemptEpoch(reporter_key) == intent.snapshot_attempt_epoch &&
+                        backend->GetNodeGeneration(instance_id, reporter_host) == intent.lifecycle_generation &&
+                        IsSnapshotLocationStaleForCleanup(
+                            backend.get(), instance_id, *location, /*preserve_in_flight=*/true);
+                }
+                if (!should_delete) {
+                    continue;
+                }
+
+                const CandidateKey candidate_key{batch.keys[i], location_id};
+                EventReportDeleteTarget target{
+                    .intent_key = intent_key,
+                    .reason = intent.type,
+                    .intent_revision = intent.revision,
+                    .block_key = batch.keys[i],
+                    .location_id = location_id,
+                    .expected_location_value = location->ToJsonString(),
+                };
+                const auto candidate_it = candidates.find(candidate_key);
+                if (candidate_it == candidates.end() ||
+                    priority(target.reason) > priority(candidate_it->second.reason)) {
+                    candidates[candidate_key] = std::move(target);
+                }
+            }
+        }
+    }
+
+    std::vector<EventReportDeleteTarget> targets;
+    targets.reserve(std::min(candidates.size(), config_.scan_batch_size));
+    for (auto &[_, target] : candidates) {
+        if (targets.size() >= config_.scan_batch_size) {
+            out_truncated = true;
+            break;
+        }
+        targets.push_back(std::move(target));
+    }
+    return targets;
+}
+
+bool CacheGarbageCollector::ExecuteEventReportDeleteBatch(const std::string &instance_id,
+                                                          uint64_t pass_id,
+                                                          const std::vector<EventReportDeleteTarget> &targets,
+                                                          const MaintenanceLocationDeleteResults *prior_results,
+                                                          MaintenanceLocationDeleteResults &out_results,
+                                                          bool &out_revisit_required) {
+    out_results.clear();
+    out_revisit_required = false;
+    if (targets.empty()) {
+        return true;
+    }
+
+    std::map<EventReportIntentKey, EventReportCleanupIntent> current_intents;
+    {
+        std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+        for (const auto &target : targets) {
+            const auto it = event_report_intents_.find(target.intent_key);
+            if (it == event_report_intents_.end() || it->second.revision != target.intent_revision) {
+                out_revisit_required = true;
+                return true;
+            }
+            current_intents.emplace(it->first, it->second);
+        }
+    }
+
+    std::vector<EventReportBackend::LifecycleMutationLease> leases;
+    leases.reserve(current_intents.size());
+    for (const auto &[key, intent] : current_intents) {
+        auto backend = intent.backend.lock();
+        if (!backend) {
+            out_revisit_required = true;
+            return true;
+        }
+        const auto current_backend = LookupEventReportBackend(key.instance_id, key.storage_type);
+        if (!current_backend || current_backend.get() != backend.get()) {
+            {
+                std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+                const auto it = event_report_intents_.find(key);
+                if (it != event_report_intents_.end() && it->second.revision == intent.revision) {
+                    event_report_intents_.erase(it);
+                }
+            }
+            RecordEventReportIntentUpdate(intent.type, "canceled");
+            out_revisit_required = true;
+            return true;
+        }
+        if (!backend->Available()) {
+            RecordEventReportRetry("backend_unavailable");
+            return false;
+        }
+
+        EventReportBackend::LifecycleMutationLease lease;
+        EventReportBackend::CleanupLeaseAcquireResult lease_result =
+            EventReportBackend::CleanupLeaseAcquireResult::kStale;
+        const ReporterSnapshotKey reporter_key{key.instance_id, key.host_ip_port};
+        if (intent.type == EventReportIntentType::kStaleSnapshot) {
+            if (backend->GetSnapshotVersion(reporter_key) != intent.committed_version ||
+                backend->GetSnapshotAttemptEpoch(reporter_key) != intent.snapshot_attempt_epoch) {
+                lease_result = EventReportBackend::CleanupLeaseAcquireResult::kStale;
+            } else {
+                lease_result =
+                    backend->AcquireActiveLifecycleCleanupLease(reporter_key, intent.lifecycle_generation, lease);
+            }
+        } else if (intent.type == EventReportIntentType::kDownHost) {
+            lease_result = backend->AcquireDownLifecycleCleanupLease(reporter_key, intent.lifecycle_generation, lease);
+        } else {
+            uint64_t generation = 0;
+            lease_result = backend->AcquireAbsentReporterCleanupLease(reporter_key, generation, lease);
+            if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kAcquired &&
+                generation != intent.lifecycle_generation) {
+                lease.reset();
+                lease_result = EventReportBackend::CleanupLeaseAcquireResult::kStale;
+            }
+        }
+
+        if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kBusy) {
+            RecordEventReportRetry("lifecycle_lease_busy");
+            return false;
+        }
+        if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kStale) {
+            {
+                std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+                const auto it = event_report_intents_.find(key);
+                if (it != event_report_intents_.end() && it->second.revision == intent.revision) {
+                    event_report_intents_.erase(it);
+                }
+            }
+            RecordEventReportIntentUpdate(intent.type, "canceled");
+            out_revisit_required = true;
+            return true;
+        }
+        leases.push_back(std::move(lease));
+    }
+
+    struct GroupedTargets {
+        std::vector<std::string> location_ids;
+        std::vector<std::string> expected_values;
+        std::vector<size_t> target_indexes;
+    };
+    std::map<KeyType, GroupedTargets> grouped;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        auto &entry = grouped[targets[i].block_key];
+        entry.location_ids.push_back(targets[i].location_id);
+        entry.expected_values.push_back(targets[i].expected_location_value);
+        entry.target_indexes.push_back(i);
+    }
+    KeyVector keys;
+    LocationIdsPerKey location_ids;
+    std::vector<std::vector<std::string>> expected_values;
+    std::vector<std::vector<size_t>> target_indexes;
+    for (auto &[key, entry] : grouped) {
+        keys.push_back(key);
+        location_ids.push_back(std::move(entry.location_ids));
+        expected_values.push_back(std::move(entry.expected_values));
+        target_indexes.push_back(std::move(entry.target_indexes));
+    }
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        RecordEventReportRetry("searcher_missing");
+        return false;
+    }
+    const auto action_begin = Clock::now();
+    RequestContext action_context("cache_gc_event_report_delete_" + std::to_string(pass_id));
+    auto result = meta_searcher->BatchDeleteLocationsForMaintenance(
+        &action_context, keys, location_ids, expected_values, prior_results);
+    const int64_t action_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - action_begin).count();
+    out_results = std::move(result.per_location_results);
+    try {
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_duration_ms") =
+            static_cast<double>(std::max<int64_t>(0, action_duration_ms));
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_wait_us") =
+            static_cast<double>(std::max<int64_t>(0, result.shard_lock_wait_time_us));
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report action metrics"); }
+
+    if (!result.sync_succeeded || (result.ec != EC_OK && result.ec != EC_MISMATCH)) {
+        return false;
+    }
+    if (out_results.size() != keys.size()) {
+        RecordEventReportRetry("delete_shape");
+        out_revisit_required = true;
+        return true;
+    }
+    for (size_t i = 0; i < out_results.size(); ++i) {
+        if (out_results[i].size() != target_indexes[i].size()) {
+            RecordEventReportRetry("delete_shape");
+            out_revisit_required = true;
+            continue;
+        }
+        for (size_t j = 0; j < out_results[i].size(); ++j) {
+            const auto &target = targets[target_indexes[i][j]];
+            const ErrorCode ec = out_results[i][j].ec;
+            if (ec == EC_OK) {
+                RecordEventReportDeleteResult(target.reason, "deleted", 1);
+            } else if (ec == EC_NOENT) {
+                RecordEventReportDeleteResult(target.reason, "noent", 1);
+            } else if (ec == EC_MISMATCH) {
+                RecordEventReportDeleteResult(target.reason, "mismatch", 1);
+                out_revisit_required = true;
+            } else {
+                RecordEventReportDeleteResult(target.reason, "error", 1);
+                out_revisit_required = true;
+            }
+        }
+    }
+    KVCM_LOG_DEBUG("cache gc event report pass[%lu] instance[%s] action targets[%zu] status[%d]",
+                   pass_id,
+                   instance_id.c_str(),
+                   targets.size(),
+                   static_cast<int>(result.ec));
+    return true;
+}
+
+void CacheGarbageCollector::CompleteEventReportPass(const std::string &instance_id, EventReportScanState &state) {
+    size_t removed = 0;
+    if (!state.revisit_required) {
+        std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+        for (const auto &[key, intent] : state.pass_intents) {
+            const auto current = event_report_intents_.find(key);
+            if (current != event_report_intents_.end() && current->second.revision == intent.revision) {
+                event_report_intents_.erase(current);
+                ++removed;
+            }
+        }
+    }
+    if (state.discovery_pass) {
+        recovery_discovery_instances_[instance_id] = true;
+    }
+    const int64_t duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - state.pass_started_at).count();
+    try {
+        ++metrics_registry_->GetCounter("cache_gc.event_report_scan_pass_count",
+                                        MetricsTags{{"status", state.revisit_required ? "revisit" : "complete"}});
+        metrics_registry_->GetGauge("cache_gc.event_report_last_pass_duration_ms") =
+            static_cast<double>(std::max<int64_t>(0, duration_ms));
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report pass metrics"); }
+    KVCM_LOG_INFO("cache gc event report pass[%lu] completed, instance[%s] removed_intents[%zu] revisit[%d] "
+                  "duration_ms[%ld]",
+                  state.pass_id,
+                  instance_id.c_str(),
+                  removed,
+                  state.revisit_required,
+                  duration_ms);
+
+    state.cursor = SCAN_BASE_CURSOR;
+    state.pass_intents.clear();
+    state.discovery_pass = false;
+    state.sync_barrier_complete = false;
+    state.revisit_required = false;
+    state.context.reset();
+    state.next_retry_at = Clock::time_point{};
+
+    if (recovery_final_snapshot_seen_ && std::all_of(recovery_discovery_instances_.begin(),
+                                                     recovery_discovery_instances_.end(),
+                                                     [](const auto &entry) { return entry.second; })) {
+        recovery_discovery_complete_ = true;
+    }
+}
+
+void CacheGarbageCollector::FailEventReportPass(const std::string &instance_id,
+                                                EventReportScanState &state,
+                                                const std::string &stage) {
+    ++state.consecutive_failures;
+    const int64_t backoff_ms = CappedEventReportRetryBackoffMs(config_.scan_interval_ms, state.consecutive_failures);
+    state.next_retry_at = Clock::now() + std::chrono::milliseconds(backoff_ms);
+    state.cursor = SCAN_BASE_CURSOR;
+    state.pass_intents.clear();
+    state.discovery_pass = false;
+    state.sync_barrier_complete = false;
+    state.revisit_required = false;
+    state.context.reset();
+    RecordEventReportRetry(stage);
+    try {
+        ++metrics_registry_->GetCounter("cache_gc.event_report_scan_pass_count", MetricsTags{{"status", "retry"}});
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report retry pass metric"); }
+    KVCM_LOG_WARN("cache gc event report instance[%s] stage[%s] failed, retry_in_ms[%ld]",
+                  instance_id.c_str(),
+                  stage.c_str(),
+                  backoff_ms);
+}
+
+std::shared_ptr<EventReportBackend>
+CacheGarbageCollector::LookupEventReportBackend(const std::string &instance_id, DataStorageType storage_type) const {
+    if (!registry_manager_ || !data_storage_manager_ || !IsEventReportStorageType(storage_type)) {
+        return nullptr;
+    }
+    const std::string group_name = registry_manager_->GetInstanceGroupName(instance_id);
+    const auto group = registry_manager_->GetInstanceGroupConfig(group_name);
+    if (!group) {
+        return nullptr;
+    }
+    for (const auto &storage_name : group->event_report_storage_candidates()) {
+        auto backend =
+            std::dynamic_pointer_cast<EventReportBackend>(data_storage_manager_->GetDataStorageBackend(storage_name));
+        if (backend && backend->GetStorageType() == storage_type) {
+            return backend;
+        }
+    }
+    return nullptr;
+}
+
+void CacheGarbageCollector::UpdateEventReportMetrics() noexcept {
+    try {
+        size_t stale_count = 0;
+        size_t down_count = 0;
+        size_t recovery_count = 0;
+        size_t observation_count = 0;
+        int64_t oldest_age_ms = 0;
+        std::set<std::string> active_instances;
+        const auto now = Clock::now();
+        {
+            std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
+            for (const auto &[key, intent] : event_report_intents_) {
+                active_instances.insert(key.instance_id);
+                if (intent.type == EventReportIntentType::kStaleSnapshot) {
+                    ++stale_count;
+                } else if (intent.type == EventReportIntentType::kDownHost) {
+                    ++down_count;
+                } else {
+                    ++recovery_count;
+                }
+                oldest_age_ms = std::max<int64_t>(
+                    oldest_age_ms,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - intent.created_at).count());
+            }
+            observation_count = recovery_observations_.size();
+        }
+        metrics_registry_->GetGauge("cache_gc.event_report_intent_count", MetricsTags{{"reason", "stale_snapshot"}}) =
+            static_cast<double>(stale_count);
+        metrics_registry_->GetGauge("cache_gc.event_report_intent_count", MetricsTags{{"reason", "down_host"}}) =
+            static_cast<double>(down_count);
+        metrics_registry_->GetGauge("cache_gc.event_report_intent_count",
+                                    MetricsTags{{"reason", "recovery_absent_host"}}) =
+            static_cast<double>(recovery_count);
+        metrics_registry_->GetGauge("cache_gc.event_report_active_instance_count") =
+            static_cast<double>(active_instances.size());
+        metrics_registry_->GetGauge("cache_gc.event_report_oldest_intent_age_ms") =
+            static_cast<double>(std::max<int64_t>(0, oldest_age_ms));
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_pending_instance_count") =
+            static_cast<double>(std::count_if(recovery_discovery_instances_.begin(),
+                                              recovery_discovery_instances_.end(),
+                                              [](const auto &entry) { return !entry.second; }));
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_observation_count") =
+            static_cast<double>(observation_count);
+        metrics_registry_->GetGauge("cache_gc.event_report_recovery_complete") =
+            recovery_discovery_complete_ ? 1.0 : 0.0;
+        metrics_registry_->GetGauge("cache_gc.event_report_sync_retry_batch_count") =
+            static_cast<double>(event_report_retry_batches_.size());
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to update event report metrics"); }
+}
+
+void CacheGarbageCollector::RecordEventReportIntentUpdate(EventReportIntentType type,
+                                                          const std::string &result) noexcept {
+    const char *reason = type == EventReportIntentType::kStaleSnapshot
+                             ? "stale_snapshot"
+                             : (type == EventReportIntentType::kDownHost ? "down_host" : "recovery_absent_host");
+    try {
+        ++metrics_registry_->GetCounter("cache_gc.event_report_intent_update_count",
+                                        MetricsTags{{"reason", reason}, {"result", result}});
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report intent metric"); }
+}
+
+void CacheGarbageCollector::RecordEventReportDeleteResult(EventReportIntentType type,
+                                                          const std::string &status,
+                                                          size_t count) noexcept {
+    if (count == 0) {
+        return;
+    }
+    const char *reason = type == EventReportIntentType::kStaleSnapshot
+                             ? "stale_snapshot"
+                             : (type == EventReportIntentType::kDownHost ? "down_host" : "recovery_absent_host");
+    try {
+        metrics_registry_->GetCounter("cache_gc.event_report_delete_location_count",
+                                      MetricsTags{{"reason", reason}, {"status", status}}) += count;
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report delete metric"); }
+}
+
+void CacheGarbageCollector::RecordEventReportRetry(const std::string &stage) noexcept {
+    try {
+        ++metrics_registry_->GetCounter("cache_gc.event_report_retry_count", MetricsTags{{"stage", stage}});
+    } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report retry metric"); }
 }
 
 void CacheGarbageCollector::PollInflightDeletes() noexcept {

@@ -152,6 +152,16 @@ public:
                                                              const LocationIdsPerKey &location_ids,
                                                              LocationsPerKey &out_locations) noexcept = 0;
 
+    // Targeted maintenance read. It must not update access/LRU/revisit state
+    // and must not populate another cache tier. Backends without an online
+    // cache can use the ordinary targeted read implementation.
+    virtual std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                           const KeyTypeVec &keys,
+                                                                           const LocationIdsPerKey &location_ids,
+                                                                           LocationsPerKey &out_locations) noexcept {
+        return GetLocations(request_context, keys, location_ids, out_locations);
+    }
+
     // 仅获取 key 的 location id 列表（不读取 location body）。
     // @param request_context    请求上下文；可为 nullptr
     // @param keys               待查询的 key 列表
@@ -164,6 +174,12 @@ public:
     virtual std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                                   const KeyTypeVec &keys,
                                                   LocationIdsPerKey &out_location_ids) noexcept = 0;
+
+    virtual std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
+                                                                const KeyTypeVec &keys,
+                                                                LocationIdsPerKey &out_location_ids) noexcept {
+        return GetLocationIds(request_context, keys, out_location_ids);
+    }
 
     // 读取指定字段名的 properties。
     // @param request_context  请求上下文；可为 nullptr
@@ -228,6 +244,15 @@ public:
                                                   int64_t limit,
                                                   MaintenanceScanBatch &out) noexcept = 0;
 
+    // Maintenance delete counterpart of GetLocationsForMaintenance(). It
+    // must not promote/touch cache entries. The caller already performed the
+    // expected-value comparison under the MetaIndexer shard lock.
+    virtual std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                                 const KeyTypeVec &keys,
+                                                                 const LocationIdsPerKey &location_ids) noexcept {
+        return DeleteLocations(request_context, keys, location_ids);
+    }
+
     // 随机采样 key。
     // @param request_context 请求上下文；可为 nullptr
     // @param count    期望采样数量
@@ -262,6 +287,11 @@ public:
     // Returns true if all writes persisted successfully, false on failure/timeout.
     // Default: no-op (sync backends have no pending writes).
     virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
+
+    // Flushes all accepted writes. Used once at the beginning of an
+    // authoritative maintenance pass. Synchronous backends are already
+    // durable and therefore use this no-op default.
+    virtual bool SyncAll() noexcept { return true; }
 
     struct AsyncWriteStats {
         int64_t max_async_queue_size = 0;
