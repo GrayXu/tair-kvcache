@@ -2588,6 +2588,47 @@ TEST(ReportEventContractTest, SnapshotAndResponseFieldNumbersMatchContract) {
     EXPECT_EQ(6, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("extra_info")->number());
 }
 
+TEST_F(CacheManagerTest, TestEventCleanupCallbackIsSafeAfterCacheManagerDestruction) {
+    CacheGarbageCollector::Config gc_config;
+    gc_config.enabled = true;
+    gc_config.event_report_cleanup_enabled = true;
+    cache_manager_->cache_garbage_collector_ =
+        std::make_shared<CacheGarbageCollector>(gc_config,
+                                                registry_manager_,
+                                                cache_manager_->meta_indexer_manager_,
+                                                cache_manager_->meta_searcher_manager_,
+                                                registry_manager_->data_storage_manager(),
+                                                cache_manager_->schedule_plan_executor_,
+                                                metrics_registry_,
+                                                cache_manager_->migration_manager_);
+
+    auto backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, backend);
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("test_instance");
+    request.set_host_ip_port("10.0.0.1:9000");
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *event = request.add_events();
+    event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    event->mutable_node_register()->add_mediums("mem");
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+
+    EventReportBackend::CleanupCallback copied_callback;
+    {
+        std::lock_guard<std::mutex> lock(backend->cleanup_cb_mutex_);
+        copied_callback = backend->cleanup_callback_;
+    }
+    ASSERT_TRUE(copied_callback);
+
+    // EventReportBackend invokes a copied callback outside its callback lock.
+    // Model that exact shutdown race: CacheManager clears and destroys GC,
+    // then the already-copied callback returns without touching either object.
+    cache_manager_.reset();
+    EXPECT_NO_THROW(copied_callback("test_instance", "10.0.0.1:9000", 1));
+    backend->Close();
+}
+
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed) {
     auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 

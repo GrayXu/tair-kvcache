@@ -414,10 +414,17 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
 
 CacheManager::~CacheManager() {
     if (cache_garbage_collector_) {
-        cache_garbage_collector_->Stop();
-        cache_garbage_collector_.reset();
+        // Close intent admission before detaching callbacks. A liveness thread
+        // may already have copied a callback, so the callback itself also uses
+        // a weak GC reference and will either observe stopped admission or an
+        // expired collector.
+        cache_garbage_collector_->RequestStop();
     }
     ClearEventCleanupCallbacks();
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Join();
+        cache_garbage_collector_.reset();
+    }
     StopRecoverRetryLoop();
     if (write_location_manager_) {
         write_location_manager_->Stop();
@@ -2546,12 +2553,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     if (!event_backend->IsCleanupCallbackSet()) {
         const std::weak_ptr<EventReportBackend> weak_backend = event_backend;
         if (cache_garbage_collector_ && cache_garbage_collector_->IsEventReportCleanupEnabled()) {
-            event_backend->SetCleanupCallback([this, requested_type, weak_backend](const std::string &cleanup_instance,
-                                                                                   const std::string &down_host,
-                                                                                   uint64_t generation) {
-                if (auto backend = weak_backend.lock()) {
-                    if (!cache_garbage_collector_->RegisterHostCleanupIntent(
-                            cleanup_instance, requested_type, down_host, generation, backend)) {
+            const std::weak_ptr<CacheGarbageCollector> weak_gc = cache_garbage_collector_;
+            event_backend->SetCleanupCallback([requested_type, weak_backend, weak_gc](
+                                                  const std::string &cleanup_instance,
+                                                  const std::string &down_host,
+                                                  uint64_t generation) {
+                if (auto backend = weak_backend.lock(); backend) {
+                    auto gc = weak_gc.lock();
+                    if (gc && !gc->RegisterHostCleanupIntent(
+                                  cleanup_instance, requested_type, down_host, generation, backend)) {
                         KVCM_INTERVAL_LOG_WARN(
                             10,
                             "EventReport liveness cleanup intent rejected, instance[%s] host[%s] generation[%" PRIu64
@@ -2954,7 +2964,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
     if (!has_host_down && event_backend->IsNodeRegistered(instance_id, host_ip_port) && cache_garbage_collector_ &&
         cache_garbage_collector_->IsEventReportCleanupEnabled()) {
-        cache_garbage_collector_->CancelHostCleanupIntent(instance_id, requested_type, host_ip_port);
+        cache_garbage_collector_->CancelHostCleanupIntent(
+            instance_id, requested_type, host_ip_port, event_backend->GetNodeGeneration(instance_id, host_ip_port));
     }
 
     if (!block_to_add.empty()) {

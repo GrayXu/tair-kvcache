@@ -415,6 +415,18 @@ MaintenanceLocationDeleteResults MetaStorageBackendManager::CompareDeleteLocatio
     if (keys.empty()) {
         return results;
     }
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        // AsyncRecoverTask may already hold an older persistent snapshot and
+        // later PutIfAbsent it into the hot cache. Defer maintenance deletion
+        // until recovery completes instead of letting that snapshot resurrect
+        // a successfully deleted EventReport Location.
+        for (auto &per_key : results) {
+            for (auto &result : per_key) {
+                result.ec = EC_OUT_OF_LIMIT;
+            }
+        }
+        return results;
+    }
 
     // Capture layer-local key contents before mutation. Besides avoiding the
     // ordinary touching read path, this lets us enqueue whole-key deletion
@@ -446,12 +458,14 @@ MaintenanceLocationDeleteResults MetaStorageBackendManager::CompareDeleteLocatio
 
     LocationIdsPerKey persistent_target_ids(keys.size());
     std::vector<std::vector<size_t>> persistent_target_indexes(keys.size());
+    std::vector<bool> hot_shapes_valid(keys.size(), true);
     for (size_t i = 0; i < keys.size(); ++i) {
         if (cache_backend_ &&
             (hot_ecs[i].size() != location_ids[i].size() || hot_locations[i].size() != location_ids[i].size())) {
             for (auto &result : results[i]) {
                 result.ec = EC_ERROR;
             }
+            hot_shapes_valid[i] = false;
             continue;
         }
         for (size_t j = 0; j < location_ids[i].size(); ++j) {
@@ -476,6 +490,9 @@ MaintenanceLocationDeleteResults MetaStorageBackendManager::CompareDeleteLocatio
 
     std::vector<std::vector<size_t>> authorized_indexes(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (!hot_shapes_valid[i]) {
+            continue;
+        }
         if (persistent_ecs[i].size() != persistent_target_ids[i].size() ||
             persistent_locations[i].size() != persistent_target_ids[i].size()) {
             for (const size_t j : persistent_target_indexes[i]) {

@@ -109,7 +109,8 @@ public:
                                    const std::shared_ptr<EventReportBackend> &backend) noexcept;
     void CancelHostCleanupIntent(const std::string &instance_id,
                                  DataStorageType storage_type,
-                                 const std::string &host_ip_port) noexcept;
+                                 const std::string &host_ip_port,
+                                 uint64_t active_lifecycle_generation) noexcept;
 
 private:
     using Clock = std::chrono::steady_clock;

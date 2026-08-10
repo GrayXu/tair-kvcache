@@ -123,6 +123,7 @@ std::map<std::string, std::string> group_by_instance;
 bool registry_recover_complete = true;
 MetaSearcher *dummy_searcher = nullptr;
 bool maintenance_sync_all_result = true;
+bool maintenance_delete_ready = true;
 size_t maintenance_sync_all_call_count = 0;
 ErrorCode maintenance_delete_status = EC_OK;
 bool maintenance_delete_sync_succeeded = true;
@@ -185,6 +186,8 @@ bool SyncAllForMaintenanceStub(void *) noexcept {
     ++maintenance_sync_all_call_count;
     return maintenance_sync_all_result;
 }
+
+bool IsMaintenanceDeleteReadyStub(void *) noexcept { return maintenance_delete_ready; }
 
 MetaSearcher::MaintenanceDeleteBatchResult
 BatchDeleteLocationsForMaintenanceStub(void *,
@@ -339,6 +342,7 @@ public:
         stub_.set(ADDR(RegistryManager, ListInstanceInfo), ListInstanceInfoStub);
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), GetMetaIndexerStub);
         stub_.set(ADDR(MetaIndexer, ScanLocationsForMaintenance), ScanLocationsForMaintenanceStub);
+        stub_.set(ADDR(MetaIndexer, IsMaintenanceDeleteReady), IsMaintenanceDeleteReadyStub);
         stub_.set(ADDR(DataStorageManager, GetDataStorageBackend), GetDataStorageBackendStub);
         stub_.set(ADDR(DataStorageManager, Exist), DataStorageExistStub);
         stub_.set(ADDR(RegistryManager, GetInstanceGroupConfig), GetInstanceGroupConfigStub);
@@ -390,6 +394,7 @@ public:
         group_by_instance.clear();
         registry_recover_complete = true;
         maintenance_sync_all_result = true;
+        maintenance_delete_ready = true;
         maintenance_sync_all_call_count = 0;
         maintenance_delete_status = EC_OK;
         maintenance_delete_sync_succeeded = true;
@@ -592,7 +597,40 @@ TEST_F(CacheGarbageCollectorTest, EventReportIntentMergeReplacementAndHostDomina
     EXPECT_EQ(CacheGarbageCollector::EventReportIntentType::kDownHost, gc->event_report_intents_.begin()->second.type);
 
     ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
-    gc->CancelHostCleanupIntent(reporter.instance_id, backend->GetStorageType(), reporter.host_ip_port);
+    gc->CancelHostCleanupIntent(reporter.instance_id,
+                                backend->GetStorageType(),
+                                reporter.host_ip_port,
+                                backend->GetNodeGeneration(reporter.instance_id, reporter.host_ip_port));
+    EXPECT_TRUE(gc->event_report_intents_.empty());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, SameLifecycleEventCannotCancelPublishedHostIntent) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const ReporterSnapshotKey reporter{"instance_a", "10.0.0.1:9000"};
+    ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
+    const uint64_t active_generation = backend->GetNodeGeneration(reporter.instance_id, reporter.host_ip_port);
+
+    // Model the liveness callback-before-unregister window: the cleanup intent
+    // is visible while the Reporter is still active in the same generation.
+    ASSERT_TRUE(gc->RegisterHostCleanupIntent(
+        reporter.instance_id, backend->GetStorageType(), reporter.host_ip_port, active_generation, backend));
+    gc->CancelHostCleanupIntent(
+        reporter.instance_id, backend->GetStorageType(), reporter.host_ip_port, active_generation);
+    ASSERT_EQ(1u, gc->event_report_intents_.size());
+
+    uint64_t down_generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, down_generation));
+    ASSERT_EQ(active_generation, down_generation);
+    ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
+    const uint64_t new_generation = backend->GetNodeGeneration(reporter.instance_id, reporter.host_ip_port);
+    ASSERT_GT(new_generation, active_generation);
+    gc->CancelHostCleanupIntent(reporter.instance_id, backend->GetStorageType(), reporter.host_ip_port, new_generation);
     EXPECT_TRUE(gc->event_report_intents_.empty());
     backend->Close();
 }
@@ -658,6 +696,27 @@ TEST_F(CacheGarbageCollectorTest, RecoveryObservationDropsExpiredBackendIncarnat
     EXPECT_EQ(0, metrics_registry_->GetGauge("cache_gc.event_report_recovery_observation_count").Get());
 }
 
+TEST_F(CacheGarbageCollectorTest, ExpiredRecoveryObservationPromotesToAbsentHostIntent) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    auto backend = AddEventReportBackend("event_report_l1p5");
+
+    const CacheGarbageCollector::EventReportIntentKey key{"instance_a", backend->GetStorageType(), "10.0.0.1:9000"};
+    const auto elapsed = std::chrono::milliseconds(backend->GetHeartbeatTimeoutMs() + backend->GetCleanupGraceMs() + 1);
+    gc->recovery_observations_.emplace(
+        key, CacheGarbageCollector::RecoveryObservation{CacheGarbageCollector::Clock::now() - elapsed, backend});
+
+    gc->PromoteExpiredRecoveryObservations();
+
+    EXPECT_TRUE(gc->recovery_observations_.empty());
+    ASSERT_EQ(1u, gc->event_report_intents_.size());
+    EXPECT_EQ(CacheGarbageCollector::EventReportIntentType::kRecoveryAbsentHost,
+              gc->event_report_intents_.begin()->second.type);
+    backend->Close();
+}
+
 TEST_F(CacheGarbageCollectorTest, RecoveryDiscoveryRelistsUntilFinalRegistrySnapshotConverges) {
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
@@ -680,6 +739,76 @@ TEST_F(CacheGarbageCollectorTest, RecoveryDiscoveryRelistsUntilFinalRegistrySnap
     EXPECT_TRUE(gc->recovery_final_snapshot_seen_);
     EXPECT_TRUE(gc->recovery_discovery_complete_);
     EXPECT_GE(list_groups_call_count, 3u);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, EventReportPassWaitsForCachedMetadataRecovery) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    gc->recovery_discovery_complete_ = true;
+    gc->recovery_final_snapshot_seen_ = true;
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    ASSERT_TRUE(gc->RegisterHostCleanupIntent("instance_a", backend->GetStorageType(), host, generation, backend));
+
+    maintenance_delete_ready = false;
+    gc->RunOneTick();
+    EXPECT_EQ(0u, maintenance_sync_all_call_count);
+    EXPECT_TRUE(scan_calls.empty());
+    EXPECT_EQ(0u, maintenance_delete_call_count);
+    ASSERT_EQ(1u, gc->event_report_intents_.size());
+
+    maintenance_delete_ready = true;
+    gc->event_report_scan_states_.at("instance_a").next_retry_at = CacheGarbageCollector::Clock::now();
+    gc->RunOneTick();
+    EXPECT_EQ(1u, maintenance_sync_all_call_count);
+    EXPECT_EQ(1u, scan_calls.size());
+    EXPECT_TRUE(gc->event_report_intents_.empty());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, CanceledIntentPassFinishesBeforeLaterPassCanReuseState) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    gc->recovery_discovery_complete_ = true;
+    gc->recovery_final_snapshot_seen_ = true;
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    ASSERT_TRUE(gc->RegisterHostCleanupIntent("instance_a", backend->GetStorageType(), host, generation, backend));
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch("1", {}, {})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+
+    gc->RunOneTick();
+    ASSERT_EQ(1u, scan_calls.size());
+    ASSERT_TRUE(gc->event_report_scan_states_.at("instance_a").context);
+    EXPECT_EQ("1", gc->event_report_scan_states_.at("instance_a").cursor);
+
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    gc->CancelHostCleanupIntent(
+        "instance_a", backend->GetStorageType(), host, backend->GetNodeGeneration("instance_a", host));
+    ASSERT_TRUE(gc->event_report_intents_.empty());
+
+    // The frozen pass remains schedulable without a live intent and reaches
+    // base before its state can be reused by a later pass.
+    gc->RunOneTick();
+    ASSERT_EQ(2u, scan_calls.size());
+    EXPECT_EQ("1", scan_calls.back().second);
+    EXPECT_FALSE(gc->event_report_scan_states_.at("instance_a").context);
+    EXPECT_EQ(SCAN_BASE_CURSOR, gc->event_report_scan_states_.at("instance_a").cursor);
     backend->Close();
 }
 

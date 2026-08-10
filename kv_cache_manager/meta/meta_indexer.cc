@@ -41,8 +41,9 @@ public:
     // spent acquiring all shard mutexes (in microseconds).
     ScopedBatchLock(MetaIndexer &indexer,
                     const std::vector<int32_t> &shard_indexs,
-                    int64_t *out_lock_wait_time_us = nullptr)
-        : indexer_(indexer), shard_indexs_(shard_indexs) {
+                    int64_t *out_lock_wait_time_us = nullptr,
+                    int64_t *out_lock_hold_time_us = nullptr)
+        : indexer_(indexer), shard_indexs_(shard_indexs), out_lock_hold_time_us_(out_lock_hold_time_us) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->lock();
@@ -50,10 +51,14 @@ public:
         if (out_lock_wait_time_us != nullptr) {
             *out_lock_wait_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
         }
+        lock_acquired_at_us_ = TimestampUtil::GetCurrentTimeUs();
     }
     ~ScopedBatchLock() {
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->unlock();
+        }
+        if (out_lock_hold_time_us_ != nullptr) {
+            *out_lock_hold_time_us_ += std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_at_us_);
         }
     }
 
@@ -63,6 +68,8 @@ public:
 private:
     MetaIndexer &indexer_;
     std::vector<int32_t> shard_indexs_;
+    int64_t *out_lock_hold_time_us_{nullptr};
+    int64_t lock_acquired_at_us_{0};
 };
 
 MetaIndexer::~MetaIndexer() {
@@ -685,45 +692,34 @@ MetaIndexer::MaintenanceDeleteBatchResult MetaIndexer::CompareDeleteLocationsFor
         return result;
     }
 
-    CacheLocationMapVector empty_locations;
-    PropertyMapVector empty_properties;
-    auto batches = MakeBatches(keys, location_ids, empty_locations, empty_properties);
     size_t hard_error_count = 0;
     RmwStats stats;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
-        std::vector<std::vector<std::string>> batch_expected_values;
-        batch_expected_values.reserve(batch.batch_indexs.size());
-        for (const int32_t global_index : batch.batch_indexs) {
-            batch_expected_values.push_back(expected_location_values[global_index]);
+    // Maintenance compare-delete may perform persistent I/O while holding the
+    // metadata mutation lock. Process one key/shard at a time so a background
+    // batch cannot simultaneously block the default 128-shard sub-batch.
+    for (size_t global_index = 0; global_index < keys.size(); ++global_index) {
+        const KeyVector batch_keys{keys[global_index]};
+        const LocationIdsPerKey batch_location_ids{location_ids[global_index]};
+        const std::vector<std::vector<std::string>> batch_expected_values{expected_location_values[global_index]};
+        const std::vector<int32_t> batch_shards{GetShardIndex(keys[global_index], mutex_shard_mask_)};
+        MaintenanceLocationDeleteResults batch_results;
+        {
+            ScopedBatchLock lock(*this, batch_shards, &stats.lock_wait_time_us, &result.shard_lock_hold_time_us);
+            batch_results = backend_manager_->CompareDeleteLocationsForMaintenance(
+                request_context, batch_keys, batch_location_ids, batch_expected_values);
         }
-        auto batch_results = backend_manager_->CompareDeleteLocationsForMaintenance(
-            request_context, batch.batch_keys, batch.batch_location_ids, batch_expected_values);
-        if (batch_results.size() != batch.batch_keys.size()) {
-            for (const int32_t global_index : batch.batch_indexs) {
-                auto &per_key = result.per_location_results[global_index];
-                for (auto &target_result : per_key) {
-                    target_result.ec = EC_ERROR;
-                    ++hard_error_count;
-                }
+        if (batch_results.size() != 1 || batch_results.front().size() != location_ids[global_index].size()) {
+            auto &per_key = result.per_location_results[global_index];
+            for (auto &target_result : per_key) {
+                target_result.ec = EC_ERROR;
+                ++hard_error_count;
             }
             continue;
         }
-        for (size_t i = 0; i < batch.batch_indexs.size(); ++i) {
-            const size_t global_index = static_cast<size_t>(batch.batch_indexs[i]);
-            if (batch_results[i].size() != location_ids[global_index].size()) {
-                auto &per_key = result.per_location_results[global_index];
-                for (auto &target_result : per_key) {
-                    target_result.ec = EC_ERROR;
-                    ++hard_error_count;
-                }
-                continue;
-            }
-            result.per_location_results[global_index] = std::move(batch_results[i]);
-            for (const auto &target_result : result.per_location_results[global_index]) {
-                if (target_result.ec != EC_OK && target_result.ec != EC_NOENT && target_result.ec != EC_MISMATCH) {
-                    ++hard_error_count;
-                }
+        result.per_location_results[global_index] = std::move(batch_results.front());
+        for (const auto &target_result : result.per_location_results[global_index]) {
+            if (target_result.ec != EC_OK && target_result.ec != EC_NOENT && target_result.ec != EC_MISMATCH) {
+                ++hard_error_count;
             }
         }
     }
@@ -752,9 +748,6 @@ void MetaIndexer::CommitMaintenanceDeleteAccounting(
         bool key_reclaimed = false;
         for (size_t j = 0; j < results[i].size(); ++j) {
             const auto &target_result = results[i][j];
-            if (target_result.ec != EC_OK && target_result.ec != EC_NOENT) {
-                continue;
-            }
             if (target_result.removed_from_hot || target_result.removed_from_persistent) {
                 SubStorageUsageByType(location_usage[i][j].first, location_usage[i][j].second);
             }
@@ -1003,6 +996,10 @@ size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetM
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
 
 bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
+
+bool MetaIndexer::IsMaintenanceDeleteReady() const noexcept {
+    return backend_manager_ && backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning;
+}
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();

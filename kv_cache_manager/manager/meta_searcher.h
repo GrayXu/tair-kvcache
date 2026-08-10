@@ -181,6 +181,7 @@ public:
         MaintenanceLocationDeleteResults per_location_results;
         bool sync_succeeded = false;
         int64_t shard_lock_wait_time_us = 0;
+        int64_t shard_lock_hold_time_us = 0;
     };
     // Exact-value metadata-only maintenance deletion. The optional prior
     // result carries mutations from a previous Sync failure so accounting is

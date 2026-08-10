@@ -727,6 +727,49 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
     EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
+TEST_F(MetaSearcherTest, TestMaintenanceRetryKeepsPriorAccountingWhenCurrentValueMismatches) {
+    const MetaSearcher::KeyVector keys = {10012};
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.8:8080";
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.8:8080/mem?source=old&size=11")}},
+    }};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    const std::string stale_expected_value = location_maps[0].at(location_id)->ToJsonString();
+
+    replace_tasks[0][0].specs = {
+        LocationSpec("linear_0", "event_report://127.0.0.8:8080/mem?source=new&size=13"),
+    };
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    ASSERT_EQ(13u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    MaintenanceLocationDeleteResults prior_results(1);
+    prior_results[0].resize(1);
+    prior_results[0][0].ec = EC_OK;
+    prior_results[0][0].removed_from_persistent = true;
+    const auto result = meta_searcher_->BatchDeleteLocationsForMaintenance(
+        request_context_.get(), keys, {{location_id}}, {{stale_expected_value}}, &prior_results);
+
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_TRUE(result.sync_succeeded);
+    ASSERT_EQ(1u, result.per_location_results.size());
+    ASSERT_EQ(1u, result.per_location_results[0].size());
+    EXPECT_EQ(EC_MISMATCH, result.per_location_results[0][0].ec);
+    EXPECT_TRUE(result.per_location_results[0][0].removed_from_persistent);
+    // The 11-byte deletion happened in the prior attempt; the retry must
+    // settle that accounting debt even though a newer 13-byte value now wins.
+    EXPECT_EQ(2u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(MetaSearcherTest, TestCleanupLocationsByHostSkipsKeysWithoutMatchingLocation) {
     const MetaSearcher::KeyVector keys = {10009, 10010, 10011};
     const std::string target_suffix = "#127.0.0.9:8080";

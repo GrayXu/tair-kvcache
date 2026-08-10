@@ -117,14 +117,14 @@ V1 复用的是同一个 `LoopThread`、HA 生命周期、maintenance scan API �
 V1 不把 EventReport batch 再提交到 `SchedulePlanExecutor`。每个 EventReport Instance pass 先完成必要的 lifecycle preflight，再执行一次 metadata `SyncAll()` barrier；随后 GC `LoopThread` 扫描一个 batch，并直接调用 `MetaSearcher::BatchDeleteLocationsForMaintenance()` 完成有界 expected-value metadata 删除，删除成功后再对本批 key 执行 `Sync()`：
 
 - EventReport 不需要物理 DELETE、delay、`CLS_DELETING` 状态流转或最终 CAD 两阶段；
-- 单次 target 数受 `scan_batch_size` 硬限制，进入 MetaIndexer 后仍按 `batch_key_size` 拆成 RMW sub-batch；
+- 单次 target 数受 `scan_batch_size` 硬限制；maintenance compare-delete 在 MetaIndexer 内按 key 串行处理，每次只持有一个 metadata shard lock，避免一个后台 action 同时锁住默认 `batch_key_size` 对应的大量 shard；
 - metadata RMW 会在 `ScopedBatchLock` 内完成 target read、compare 和 backend mutation，因此不仅阻塞 GC 线程，也会阻塞命中相同 MetaIndexer shard 的 StartWrite、FinishWrite、Reclaimer admission/CAS 等 metadata mutation；普通 `MetaIndexer::Get*()` 不获取该 shard lock，但仍可能与 GC 竞争 Local LRU/item lock、Redis QPS、连接池和 AsyncRedis queue；
 - cached metadata 模式在 shard lock 内先读取 hot target；只有目标 Location 缺失时才从 persistent 读取该 target 参与比较，不回填完整 key，也不覆盖 hot cache 中的其他 Location；hot target 已存在但值不同表示可能有 barrier 后的新写，必须返回 mismatch；
 - HOST_DOWN lifecycle lease 可以从最终校验一直持有到 metadata 删除结束；
 - demotion 的 `GC.Join()` 自然等待当前一个有界 metadata batch 返回，不会留下跨 Leader 继续执行的 EventReport cleanup task；
 - 不占用共享 Executor worker，也不需要为这条 metadata-only 路径复制 promise/Future 状态机。
 
-默认 `batch_key_size=128`、`mutex_shard_num=1024` 时，均匀分布且 key 落在不同 shard 的单个 sub-batch 最多同时覆盖约 12.5% shard；实际比例取决于 key 分布和 Instance 配置。persistent-only 模式或 cached 模式的 target miss 会把 persistent read/write 延迟带入 shard lock 临界区；hot hit + AsyncRedis 模式通常只包含 Local read/delete 和异步 enqueue，但 enqueue 反压仍会延长持锁时间。`MetaIndexer::Sync(delete_keys)` 在 RMW 返回、shard lock 释放后执行，只有 Reporter lifecycle lease 持有到 Sync 完成。
+默认 `mutex_shard_num=1024` 时，maintenance action 任一时刻最多持有一个 shard（约 0.1%）；多个 key 顺序推进，不再一次占用最多约 12.5% shard。persistent-only 模式或 cached 模式的 target miss 仍会把 persistent read/write 延迟带入当前单 shard 临界区；hot hit + AsyncRedis 模式通常只包含 Local read/delete 和异步 enqueue，但 enqueue 反压仍会延长持锁时间。`MetaIndexer::Sync(delete_keys)` 在全部 RMW 返回、shard lock 释放后执行，只有 Reporter lifecycle lease 持有到 Sync 完成。
 
 普通 WRITING/SERVING GC 候选仍沿用 `SchedulePlanExecutor::SubmitAsync()`；本设计只对 EventReport metadata reconciliation 使用直接条件删除。
 
@@ -132,7 +132,7 @@ V1 不把 EventReport batch 再提交到 `SchedulePlanExecutor`。每个 EventRe
 
 该取舍与 Reclaimer 的异步 metadata admission 不矛盾。Reclaimer 处于容量水位压力路径，需要快速遍历 Group、及时生效 in-flight credit，不能让一次 Get/CAS/Sync 阻塞后续回收决策；EventReport GC 是低优先级、最终一致的后台收敛路径，没有水位止损 SLA，也不要求一个 tick 内持续提交任务。V1 因此接受一个有界 metadata batch 暂停 GC 自身调度，以换取更少的 Future/pending 状态以及更直接的 lifecycle/demotion 边界。
 
-“有界”仅限制 key/Location 数量，并不保证 Redis 延迟或在线 mutation 的等待时间；慢 metadata 操作会暂停 EventReport lane、regular lane，使相同 shard 的 metadata mutation 排队，并令 `GC.Join()` 等待到底层 command timeout。该风险必须通过 action duration、shard lock wait、在线 Start/Finish/Reclaimer 延迟、Join latency 和 metadata error 指标验证。把 action 移入 Executor 只能解除 GC tick/Join 的同步等待，不能消除 MetaIndexer shard lock 和 Redis 资源竞争；只有实测证明 GC 线程阻塞成为主要问题时，再引入带 action-time fence 和 GC lifecycle token 的异步 metadata cleanup task。
+“有界”仅限制 key/Location 数量，并不保证 Redis 延迟或在线 mutation 的等待时间；慢 metadata 操作会暂停 EventReport lane、regular lane，使当前相同 shard 的 metadata mutation 排队，并令 `GC.Join()` 等待到底层 command timeout。该风险必须通过 action duration、shard lock wait、shard lock hold、在线 Start/Finish/Reclaimer 延迟、Join latency 和 metadata error 指标验证。把 action 移入 Executor 只能解除 GC tick/Join 的同步等待，不能消除 MetaIndexer shard lock 和 Redis 资源竞争；只有实测证明 GC 线程阻塞成为主要问题时，再引入带 action-time fence 和 GC lifecycle token 的异步 metadata cleanup task。
 
 ### 3.4 不持久化进程内 generation
 
@@ -167,7 +167,7 @@ flowchart LR
 | `CacheManager::ReportEvent` | Snapshot commit 和显式 HOST_DOWN 后登记 intent；REGISTER/恢复事件取消已失效的 host intent |
 | `EventReportBackend` | liveness cleanup 保留“先 callback、再 generation-checked unregister”的 heartbeat fencing；callback 只登记 intent，最终 action 通过 tri-state lifecycle lease 复核；继续提供 committed/in-flight、attempt epoch，并补充“Reporter 当前不存在”清理 lease |
 | `CacheGarbageCollector` | 保存可合并 intent、按 Instance 调度 cursor pass、执行匹配和有界 metadata 删除 |
-| `MetaIndexer` | 继续提供 authoritative、no-touch 的 `ScanLocationsForMaintenance()`；增加 Instance 级 `SyncAll()` barrier 和独立的 maintenance target compare-delete 契约，并暴露 action shard-lock wait |
+| `MetaIndexer` | 继续提供 authoritative、no-touch 的 `ScanLocationsForMaintenance()`；增加 Instance 级 `SyncAll()` barrier 和独立的 maintenance target compare-delete 契约；action 按单 key/shard 串行，并暴露 shard-lock wait/hold |
 | `MetaStorageBackendManager` 与各 metadata backend | 实现 target-level missing-only persistent read、no-backfill/no-touch 删除和 hot/persistent 分层结果；不能复用现有整 key refresh/fallback 语义 |
 | `MetaSearcher` | 对外提供 maintenance expected-value compare-delete，并返回足以区分 hot/persistent 实际删除和 whole-key reclaim 的逐 target 结果 |
 | `SchedulePlanExecutor` | 不承载 EventReport 扫描或 metadata-only handler；普通 GC/Reclaimer/Migration 行为不变 |
@@ -240,7 +240,7 @@ struct EventReportCleanupIntent {
 - 显式 HOST_DOWN 在 generation-checked unregister 成功后登记；liveness callback 可在 unregister 前登记，但 Host intent 只在 action-time down lease 成功后获得删除授权；
 - recovery observation 到期转 intent 时，先获取 absent Reporter lease，再写入 RecoveryAbsentHost intent。
 
-Snapshot/Recovery lease 持有到 intent map 更新完成。Host intent map 额外按 lifecycle generation 单调合并：较旧 callback 即使晚到也不能覆盖较新 intent。REGISTER 或 heartbeat recovery 已推进 generation 时，旧 Host intent 最终会被 action-time lease 取消。intent mutex 内不获取 lifecycle lease，I/O 阶段也不持有 intent mutex。
+Snapshot/Recovery lease 持有到 intent map 更新完成。Host intent map 额外按 lifecycle generation 单调合并：较旧 callback 即使晚到也不能覆盖较新 intent。事件路径只在观察到严格更大的 active generation 时取消 Host intent；same-generation 事件可能处在 liveness callback 与 conditional unregister 之间，不能提前擦除已发布 intent。REGISTER 或 heartbeat recovery 已推进 generation 时，旧 Host intent 最终会被事件路径或 action-time lease 取消。intent mutex 内不获取 lifecycle lease，I/O 阶段也不持有 intent mutex。
 
 ### 5.3 并发访问
 
@@ -297,14 +297,15 @@ struct EventReportIntentScanState {
 调度规则：
 
 1. active Instance 按 `instance_id` 排序并 round-robin，每个 tick 最多推进一个 Instance 的一个 cursor batch；
-2. pass 从 base cursor 开始时冻结当前 intent revision 集合，并调用 `MetaIndexer::SyncAll()`；barrier 失败时不开始 Scan；
+2. pass 从 base cursor 开始时冻结当前 intent revision 集合；cached metadata 的异步 recover 未结束时不开始 pass，ready 后再调用 `MetaIndexer::SyncAll()`，barrier 失败时不开始 Scan；
 3. `SyncAll()` 保证 intent 登记前已经 accepted 的 AsyncRedis mutation 在全部 consumer queue 中先于本 pass 落稳；barrier 后的新写由 hot-cache expected-value 比较保护；
 4. 同一 batch 对冻结集合中的全部 Reporter/host 做匹配；
 5. cursor 回到 base 且本 pass 的 metadata 删除均已同步返回后，才判定 pass 完成；
 6. 只移除 revision 与 pass 起点仍一致、且 fence 仍有效的 intent；pass 中途新增或更新的 intent 留给下一 pass；
 7. target budget 截断、expected-value mismatch 或 pass 中途 revision 更新只设置 `revisit_required`，它们是正常并发/覆盖不足，不增加失败 backoff；cursor 到 base 后从新 pass 重新覆盖；
 8. barrier/scan/delete 等真实失败增加 `consecutive_failures`，保留 intent 并从 base 重试；backoff 从 `scan_interval_ms` 起步、上限 60 秒；任一 batch 在对应失败阶段取得成功进展后立即清零 `consecutive_failures` 和旧 backoff；
-9. Registry recovery 尚未完成时，Indexer/backend 暂时不存在按可重试处理；只有 authoritative Registry 已确认 Instance/storage 删除，或 backend incarnation 已被替换时，才取消对应 runtime intent。
+9. Registry recovery 尚未完成时，Indexer/backend 暂时不存在按可重试处理；只有 authoritative Registry 已确认 Instance/storage 删除，或 backend incarnation 已被替换时，才取消对应 runtime intent；
+10. pass 中途所有 live intent 都被取消时，已经冻结的 pass 仍继续从当前 cursor 走到 base 并清空 context；后续新 intent 必须从新的 barrier 和 base cursor 开始，不能继承旧 pass 的半程状态。
 
 由于一个 pass 开始后到达的新 intent 没有覆盖已经扫过的 key，所以不能在当前 cursor 到 base 时顺带标记完成。这个 revision 规则保证合并不会以遗漏为代价。
 
@@ -314,7 +315,7 @@ struct EventReportIntentScanState {
 - 每个 tick 最多删除 `scan_batch_size` 个 Location；超出部分只设置 `revisit_required`，在下一 pass 重新覆盖，不计 operation error；
 - 一个 Location 同时命中多个 intent 时只生成一个 target，优先级为 `DownHost > RecoveryAbsentHost > StaleSnapshot`；
 - EventReport direct metadata delete 不占普通 GC 的 Future 槽位，但仍受“每 tick 一个 scan batch + 一个 target batch”约束；
-- 普通 GC 的 `pending_locations_` 继续覆盖 Executor accepted 到 CAS 窗口；EventReport 不建立物理删除 pending，但每个 active Instance 至多保留一个、大小不超过 target budget 的 maintenance retry/accounting batch，防止重试重复扣减 usage/key count。某 Instance 的 retry backoff 不阻塞其他 Instance 继续推进。
+- 普通 GC 的 `pending_locations_` 继续覆盖 Executor accepted 到 CAS 窗口；EventReport 不建立物理删除 pending，但每个 active Instance 至多保留一个、大小不超过 target budget 的 maintenance retry/accounting batch，防止重试重复扣减 usage/key count。该 retry 携带已经发生但尚未结算的 mutation flag，不能按次数上限直接丢弃；V1 采用最高 60 秒退避并保留到成功或进程生命周期结束。它只暂停对应 Instance，其他 Instance 继续推进，并由 retry count、retry batch count 与 oldest intent age 暴露长期积压。
 
 ### 6.4 为什么不为每个 intent 保存 cursor
 
@@ -395,7 +396,7 @@ discovery batch 本身只记录 identity，不删除 metadata；recovery-complet
 
 该 action 不能只给现有 `BatchDeleteLocations()` 增加一个 boolean 后复用普通读写路径。现有 cached backend fallback 会整 key 回填，Local `Lookup()` 会设置 hit、改变 LRU 并调用 `TouchAccessTime()`，现有返回值也会让 cache `EC_NOENT` 遮蔽 persistent 已实际删除的结果。V1 必须提供显式的 maintenance target read/compare-delete 接口，并贯穿 MetaSearcher、MetaIndexer、MetaStorageBackendManager 和各 backend。
 
-每个 RMW sub-batch 按 MetaIndexer 既有顺序获取目标 shard lock，并在锁内完成 compare 和 backend mutation；锁在 `Sync()` 前释放。该临界区会与相同 shard 的 StartWrite、FinishWrite、Reclaimer/Executor RMW 直接竞争，不能描述为 GC 私有开销。
+每个 key 独立获取一个 MetaIndexer shard lock，并在锁内完成 compare 和 backend mutation；一个 key 完成后立即释放，再处理下一个 key，全部锁均在 `Sync()` 前释放。该临界区仍会与相同 shard 的 StartWrite、FinishWrite、Reclaimer/Executor RMW 直接竞争，但不会让一个默认 128-key action 同时占用约 12.5% shard，不能描述为 GC 私有开销。
 
 maintenance compare-delete 在 metadata shard lock 内执行以下逻辑：
 
@@ -430,9 +431,9 @@ struct MaintenanceLocationDeleteResult {
 - 值已变化：`EC_MISMATCH`，正常竞态，不记 operation error，但本 pass 标记 `revisit_required`；
 - backend/shape/metadata 错误：本 pass 失败，保留 intent 重试。
 
-RMW 返回后调用 `MetaIndexer::Sync(delete_keys)`。只有 Sync 成功且本批没有 hard error，才根据当前结果与 prior result 合并后的分层 mutation flag 提交一次 storage usage/reclaimed key count；Sync 或部分删除失败时，为该 Instance 保留这个有界 batch 的 expected value 和累计分层结果，下一 tick 在重新取得 intent/lifecycle fence 后优先重试，不能退化为无状态重扫后再次扣减。成功提交 accounting 后立即移除 retry batch。进程退出会丢弃该内存重试状态；新进程从 persistent metadata 恢复 usage/key count，因此不跨进程恢复。
+RMW 返回后调用 `MetaIndexer::Sync(delete_keys)`。只有 Sync 成功且本批没有 hard error，才根据当前结果与 prior result 合并后的分层 mutation flag 提交一次 storage usage/reclaimed key count；mutation flag 表达已经发生的历史事实，即使本次复核因新值返回 `EC_MISMATCH` 也不能丢弃。Sync 或部分删除失败时，为该 Instance 保留这个有界 batch 的 expected value 和累计分层结果，下一 tick 在重新取得 intent/lifecycle fence 后优先重试，不能退化为无状态重扫后再次扣减。成功提交 accounting 后立即移除 retry batch。进程退出会丢弃该内存重试状态；新进程从 persistent metadata 恢复 usage/key count，因此不跨进程恢复。
 
-pass 起点的 `SyncAll()` 解决历史 accepted mutation 的可见性，batch 结尾的 `Sync(delete_keys)` 解决本次删除的持久化，两者缺一不可。若重试发现 persistent 已无 target，表示此前删除已落盘，可以完成尚未提交的 accounting；若 persistent 值已变化则返回 mismatch 并放弃旧 accounting。若 hot/persistent 仍不一致，则 intent 保持积压并通过指标暴露，不能以清理完整性为由覆盖较新的 hot value。
+pass 起点的 `SyncAll()` 解决历史 accepted mutation 的可见性，batch 结尾的 `Sync(delete_keys)` 解决本次删除的持久化，两者缺一不可。cached metadata 的异步 recover 完成前不启动 EventReport pass，meta 层也会拒绝 maintenance compare-delete，避免 recover 持有的旧 persistent snapshot 在删除后重新回填 hot cache。若重试发现 persistent 已无 target，表示此前删除已落盘，可以完成尚未提交的 accounting；若 persistent 值已变化则返回 mismatch，保留新值，同时在 Sync 后结清此前已经发生的 mutation accounting。若 hot/persistent 仍不一致，则 intent 保持积压并通过指标暴露，不能以清理完整性为由覆盖较新的 hot value。
 
 EventReport 路径不执行 `SERVING -> DELETING` CAS，不调用 `Sync + DataStorage Delete + CAD`，也不设置 `metadata_only` 后进入通用物理删除任务。它直接执行带 expected value 的 metadata compare-and-delete，因此不会产生 EventReport `CLS_DELETING` 中间态。
 
@@ -454,7 +455,7 @@ EventReport 路径不执行 `SERVING -> DELETING` CAS，不调用 `Sync + DataSt
 
 升主沿用后台 GC 的启动顺序。EventReport intent 只在 GC Start 成功后接收；leader-only 请求开放前 GC 已可消费 intent。
 
-`RequestStop()` 除设置 scan stop flag 外，还要原子关闭 intent admission。此后到达的 liveness callback 只记录一次受控 skip，不再写入 intent map；`Join()` 在 `LoopThread` 停止后清空 intent、cursor、backoff 和 recovery observation。这样 EventReportBackend 尚未进入 `DoCleanup()` 的短窗口内即使触发 liveness，也不会把新状态写回一个已停止的 GC。相同进程再次升主时按重启语义从 base cursor 和 recovery discovery 重新开始。
+`RequestStop()` 除设置 scan stop flag 外，还要原子关闭 intent admission。EventReport liveness callback 只捕获 `weak_ptr<CacheGarbageCollector>` 和 backend incarnation，不读取 `CacheManager` 的 GC 成员；进程析构按 `RequestStop -> ClearEventCleanupCallbacks -> Join/reset` 执行。这样即使 liveness 线程已经把 callback 拷贝到锁外，回调也只会观察到关闭的 admission 或失效 weak reference，不会与 shared_ptr reset 数据竞争或解引用已析构对象。`Join()` 在 `LoopThread` 停止后清空 intent、cursor、backoff 和 recovery observation；相同进程再次升主时按重启语义从 base cursor 和 recovery discovery 重新开始。
 
 降级顺序保持：
 
@@ -489,6 +490,7 @@ EventReport 删除在 GC `LoopThread` 内同步执行，因此 `Join()` 最多�
 | intent 登记重复 | 合并并计数，不唤起新的独立 scan task |
 | intent map 更新异常 | ReportEvent 主操作结果不回滚；记录错误，等待重试事件或恢复扫描 |
 | Registry recovery 未完成且 Indexer/backend 暂缺 | 保留 intent/discovery state，按 backoff 重列举和重试 |
+| cached metadata 异步 recover 尚未完成 | 不执行 `SyncAll/Scan/Delete`，按 `meta_recovering` 退避；meta 层拒绝直接 maintenance mutation，防止旧 snapshot 回填复活 |
 | authoritative Registry 确认 Instance/storage 已删除或 backend 对象已替换 | 取消对应 runtime intent，记录取消原因 |
 | 同一 backend 暂时 unavailable | 不扫描或删除，保留 intent 并按 `backend_unavailable` 退避 |
 | `SyncAll()` barrier 失败 | 不开始本 pass Scan，按 capped backoff 重试，并让出其他 Instance |
@@ -526,6 +528,7 @@ EventReport 删除在 GC `LoopThread` 内同步执行，因此 `Join()` 最多�
 | `cache_gc.event_report_last_pass_duration_ms` | Gauge | 最近完成 pass 耗时 |
 | `cache_gc.event_report_last_action_duration_ms` | Gauge | 最近一次 maintenance compare-delete + Sync 的总耗时 |
 | `cache_gc.event_report_last_action_shard_lock_wait_us` | Gauge | 最近一次 maintenance action 等待 MetaIndexer shard lock 的累计时间 |
+| `cache_gc.event_report_last_action_shard_lock_hold_us` | Gauge | 最近一次 maintenance action 持有 MetaIndexer shard lock 的累计时间；任一时刻只持一个 shard |
 | `cache_gc.event_report_sync_retry_batch_count` | Gauge | 当前有界 Sync/accounting retry batch 数；每个 active Instance 至多 1 个 |
 
 指标不使用 `instance_id`、host、cursor 或 opaque generation 作为 tag，避免 Reporter/keyspace 增长导致高基数。指标回答总体积压、pass/recovery 是否推进、action 是否变慢和失败阶段；精确扫描位置由诊断日志中的 `pass_id`、instance、storage type、host、intent revision、cursor、batch key/target 数表达，但不打印完整 Snapshot 内容或全部 URI。
@@ -593,7 +596,7 @@ EventReport 删除在 GC `LoopThread` 内同步执行，因此 `Join()` 最多�
 | `kv_cache_manager/manager/cache_manager.cc` | 装配 GC 与 `MetaSearcherManager`；Snapshot/HOST_DOWN/REGISTER/liveness 接入 intent；feature gate 下停止投递 legacy scan task |
 | `kv_cache_manager/data_storage/event_report_backend.h/.cc` | 保留 liveness callback-before-unregister fencing 并将 callback 明确为 intent；提供区分 `kAcquired/kBusy/kStale` 的 GC-facing lifecycle lease、recovery absent lease、availability/incarnation 校验和只读 timeout/grace 访问 |
 | `kv_cache_manager/manager/meta_searcher.h/.cc` | 增加显式 maintenance expected-value compare-delete API，透传逐 target hot/persistent mutation、whole-key reclaim 和 mismatch/error 结果；不能只给现有接口增加 boolean |
-| `kv_cache_manager/meta/meta_indexer.h/.cc` | 增加 `SyncAll()` barrier、maintenance RMW 编排、sub-batch shard-lock wait 统计和分层 accounting；保持 `Sync()` 在 shard lock 外执行 |
+| `kv_cache_manager/meta/meta_indexer.h/.cc` | 增加 `SyncAll()` barrier、recover-ready gate、单 key/shard maintenance RMW、shard-lock wait/hold 统计和分层 accounting；保持 `Sync()` 在 shard lock 外执行 |
 | `kv_cache_manager/meta/meta_storage_backend.h`、`meta_storage_backend_manager.h/.cc` | 定义并编排 target-level missing-only read、no-touch/no-backfill compare-delete、跨 hot/persistent 联合 whole-key 判定和分层结果；禁止整 key fallback 覆盖 hot cache |
 | `kv_cache_manager/meta/meta_local_backend.h/.cc`、`meta_async_redis_backend.h/.cc` | Local 覆盖 maintenance no-touch read/delete 并修复 full-shard iteration 锁序；Dummy 继承 Local 语义，Redis 使用无 LRU 的默认 targeted API，AsyncRedis 另补全队列 barrier |
 | `kv_cache_manager/common/cache/advanced_cache.h`、`sharded_cache.h`、`lru_cache.h/.cc` | 提供精确 key 的 no-touch callback，使 Local maintenance 读取不 promote/hit/touch，并让 full-shard iteration 锁内只复制 key |
@@ -619,7 +622,7 @@ V1 不新增独立线程、持久化 store、通用 Rule Engine 或 EventReport 
 
 1. **Snapshot 跨重启依赖下一次全量**：realtime-only Reporter 没有 authoritative generation，不能安全回收历史 version。这是当前 soft recovery 语义的直接结果，不是 GC 扫描遗漏。
 2. **全量扫描成本仍为 O(keyspace)**：本设计消除事件数乘法，但不消除每个必要 pass 的全扫。若大规模 Reporter 仍不可接受，再引入 Reporter 反向索引。
-3. **同步 metadata batch 会影响在线 mutation、tick 和 Join**：目标数有硬上限，但 target read/compare/backend mutation 在 `ScopedBatchLock` 内执行。默认 128-key sub-batch、1024 shards 下可能同时覆盖约 12.5% shard，使同 shard StartWrite、FinishWrite、Reclaimer/Executor RMW 等待；pass barrier、persistent fallback、AsyncRedis enqueue 反压、Sync 和底层 Redis timeout 还会拉长 action 或 Join。`SyncAll()` 会等待该 Instance 全部 AsyncRedis consumer queue 的既有写入，不只等待目标 Reporter。生产灰度必须观察 shard-lock wait、在线 mutation 延迟、action/Join 时长和 Redis/queue 负载。
+3. **同步 metadata batch 会影响在线 mutation、tick 和 Join**：目标数有硬上限，target read/compare/backend mutation 仍在 `ScopedBatchLock` 内执行；V1 按 key 串行，使 1024-shard 配置下任一时刻最多持有一个 shard，而不是按默认 128-key sub-batch 同时覆盖约 12.5% shard。当前同 shard StartWrite、FinishWrite、Reclaimer/Executor RMW 仍需等待；pass barrier、persistent fallback、AsyncRedis enqueue 反压、Sync 和底层 Redis timeout 还会拉长 action 或 Join。`SyncAll()` 会等待该 Instance 全部 AsyncRedis consumer queue 的既有写入，不只等待目标 Reporter。生产灰度必须观察 shard-lock wait/hold、在线 mutation 延迟、action/Join 时长和 Redis/queue 负载。
 4. **maintenance meta 改造不是薄接口透传**：no-touch、no-backfill、target-level missing-only compare 和 hot/persistent 分层结果与普通 Lookup、整 key refresh/fallback 语义不同，已经贯穿 common cache、BackendManager、MetaIndexer 和 MetaSearcher。Local full-shard scan 已改为锁内只取 key、锁外精确读取；剩余风险是单个 no-touch copy/delete 仍会短时占用对应 LRU shard，需通过并发与延迟指标继续验证。
 5. **Sync/accounting 重试有内存窗口**：V1 每个 active Instance 只保留一个有界 retry batch，避免单 Instance 无界累积并允许其他 Instance 继续推进；必须用分层 mutation result 保证进程内只扣减一次。进程崩溃时该状态丢失，依赖新进程从 persistent metadata 重建 usage/key count，而不是恢复旧 action。
 6. **频繁重启会重置 absence grace**：V1 偏向避免误删；若必须跨进程累计 deadline，需要与持久化 Reporter lifecycle 一起设计。

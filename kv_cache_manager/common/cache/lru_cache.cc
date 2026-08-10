@@ -485,16 +485,38 @@ bool LRUCacheShard::ApplyToEntryNoTouch(
         return false;
     }
     assert(e->InCache());
+    const bool in_lru = !e->HasRefs();
     const ssize_t delta = callback(e->value, e->total_charge, e->helper);
     if (delta > 0) {
-        e->total_charge += static_cast<size_t>(delta);
-        usage_ += static_cast<size_t>(delta);
+        const size_t increase = static_cast<size_t>(delta);
+        e->total_charge += increase;
+        usage_ += increase;
+        if (in_lru) {
+            lru_usage_ += increase;
+            if (e->InHighPriPool()) {
+                high_pri_pool_usage_ += increase;
+            } else if (e->InLowPriPool()) {
+                low_pri_pool_usage_ += increase;
+            }
+            MaintainPoolSize();
+        }
     } else if (delta < 0) {
         size_t decrease = static_cast<size_t>(-delta);
         decrease = std::min(decrease, e->total_charge);
         decrease = std::min(decrease, usage_);
         e->total_charge -= decrease;
         usage_ -= decrease;
+        if (in_lru) {
+            assert(lru_usage_ >= decrease);
+            lru_usage_ -= decrease;
+            if (e->InHighPriPool()) {
+                assert(high_pri_pool_usage_ >= decrease);
+                high_pri_pool_usage_ -= decrease;
+            } else if (e->InLowPriPool()) {
+                assert(low_pri_pool_usage_ >= decrease);
+                low_pri_pool_usage_ -= decrease;
+            }
+        }
     }
     return true;
 }

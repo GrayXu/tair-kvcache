@@ -126,6 +126,7 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetGauge("cache_gc.event_report_last_pass_duration_ms") = 10;
         metrics_registry_->GetGauge("cache_gc.event_report_last_action_duration_ms") = 3;
         metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_wait_us") = 7;
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_hold_us") = 9;
         metrics_registry_->GetGauge("cache_gc.event_report_sync_retry_batch_count") = 1;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }

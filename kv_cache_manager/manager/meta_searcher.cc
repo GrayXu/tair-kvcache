@@ -1973,6 +1973,7 @@ MetaSearcher::BatchDeleteLocationsForMaintenance(RequestContext *request_context
         request_context, keys, location_ids_per_key, expected_location_values);
     out.ec = result.ec;
     out.shard_lock_wait_time_us = result.shard_lock_wait_time_us;
+    out.shard_lock_hold_time_us = result.shard_lock_hold_time_us;
     out.per_location_results = std::move(result.per_location_results);
     if (out.per_location_results.size() != keys.size()) {
         out.ec = EC_ERROR;
@@ -1997,18 +1998,15 @@ MetaSearcher::BatchDeleteLocationsForMaintenance(RequestContext *request_context
     for (size_t i = 0; i < out.per_location_results.size(); ++i) {
         for (size_t j = 0; j < out.per_location_results[i].size(); ++j) {
             auto &current = out.per_location_results[i][j];
-            if (current.ec == EC_OK || current.ec == EC_NOENT) {
-                if (prior_shape_valid) {
-                    const auto &prior = (*prior_results)[i][j];
-                    current.removed_from_hot = current.removed_from_hot || prior.removed_from_hot;
-                    current.removed_from_persistent = current.removed_from_persistent || prior.removed_from_persistent;
-                    current.reclaimed_hot_key = current.reclaimed_hot_key || prior.reclaimed_hot_key;
-                    current.reclaimed_persistent_key =
-                        current.reclaimed_persistent_key || prior.reclaimed_persistent_key;
-                }
-                needs_sync = needs_sync || current.removed_from_hot || current.removed_from_persistent ||
-                             current.reclaimed_hot_key || current.reclaimed_persistent_key;
+            if (prior_shape_valid) {
+                const auto &prior = (*prior_results)[i][j];
+                current.removed_from_hot = current.removed_from_hot || prior.removed_from_hot;
+                current.removed_from_persistent = current.removed_from_persistent || prior.removed_from_persistent;
+                current.reclaimed_hot_key = current.reclaimed_hot_key || prior.reclaimed_hot_key;
+                current.reclaimed_persistent_key = current.reclaimed_persistent_key || prior.reclaimed_persistent_key;
             }
+            needs_sync = needs_sync || current.removed_from_hot || current.removed_from_persistent ||
+                         current.reclaimed_hot_key || current.reclaimed_persistent_key;
         }
     }
 

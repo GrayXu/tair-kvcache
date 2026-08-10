@@ -16,6 +16,25 @@
 
 namespace kv_cache_manager {
 
+class MalformedMaintenanceReadBackend : public MetaLocalBackend {
+public:
+    void SetMalformed(bool malformed) { malformed_ = malformed; }
+
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override {
+        auto results = MetaLocalBackend::GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+        if (malformed_ && !results.empty()) {
+            results.front().clear();
+        }
+        return results;
+    }
+
+private:
+    bool malformed_{false};
+};
+
 class MetaStorageBackendManagerTest : public TESTBASE {
 public:
     void SetUp() override { request_context_ = std::make_shared<RequestContext>("test_trace_id"); }
@@ -361,6 +380,58 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteIsExactAndRecl
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Exists(nullptr, {888}, persistent_exists));
     EXPECT_EQ((std::vector<bool>{false}), hot_exists);
     EXPECT_EQ((std::vector<bool>{false}), persistent_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteDefersDuringCachedRecovery) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_recover_guard";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_recover_guard", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({889});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+    const auto expected = batch.batch_locations[0].at("loc_889")->ToJsonString();
+
+    // Model the interval in which AsyncRecoverTask may still hold a stale
+    // persistent snapshot. The maintenance path must make no mutation.
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    auto result = mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {889}, {{"loc_889"}}, {{expected}});
+    ASSERT_EQ(1u, result.size());
+    ASSERT_EQ(1u, result[0].size());
+    EXPECT_EQ(EC_OUT_OF_LIMIT, result[0][0].ec);
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    CacheLocationMapVector remaining;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetLocations(nullptr, {889}, remaining));
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(1u, remaining[0].count("loc_889"));
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceCompareDeleteRejectsMalformedHotReadShape) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_malformed_hot_shape";
+    std::filesystem::remove(path);
+    auto config = MakeDualConfig(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_malformed_hot_shape", config));
+    auto malformed_backend = std::make_unique<MalformedMaintenanceReadBackend>();
+    ASSERT_EQ(EC_OK, malformed_backend->Init("inst_maintenance_malformed_hot_shape", config));
+    auto *malformed_backend_raw = malformed_backend.get();
+    mgr.cache_backend_ = std::move(malformed_backend);
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({890});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+    malformed_backend_raw->SetMalformed(true);
+    const auto expected = batch.batch_locations[0].at("loc_890")->ToJsonString();
+    auto result = mgr.CompareDeleteLocationsForMaintenance(request_context_.get(), {890}, {{"loc_890"}}, {{expected}});
+    ASSERT_EQ(1u, result.size());
+    ASSERT_EQ(1u, result[0].size());
+    EXPECT_EQ(EC_ERROR, result[0][0].ec);
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 

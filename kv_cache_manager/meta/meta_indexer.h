@@ -55,6 +55,7 @@ public:
         ErrorCode ec = EC_OK;
         MaintenanceLocationDeleteResults per_location_results;
         int64_t shard_lock_wait_time_us = 0;
+        int64_t shard_lock_hold_time_us = 0;
     };
 
 public:
@@ -136,6 +137,9 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
     bool SyncAll() noexcept;
+    // EventReport maintenance compare-delete must not race the asynchronous
+    // cached-metadata backfill, which could otherwise resurrect a deleted key.
+    bool IsMaintenanceDeleteReady() const noexcept;
 
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;

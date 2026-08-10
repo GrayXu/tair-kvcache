@@ -399,7 +399,8 @@ bool CacheGarbageCollector::RegisterHostCleanupIntent(const std::string &instanc
 
 void CacheGarbageCollector::CancelHostCleanupIntent(const std::string &instance_id,
                                                     DataStorageType storage_type,
-                                                    const std::string &host_ip_port) noexcept {
+                                                    const std::string &host_ip_port,
+                                                    uint64_t active_lifecycle_generation) noexcept {
     try {
         bool canceled = false;
         EventReportIntentType canceled_type = EventReportIntentType::kDownHost;
@@ -408,7 +409,12 @@ void CacheGarbageCollector::CancelHostCleanupIntent(const std::string &instance_
             const EventReportIntentKey key{instance_id, storage_type, host_ip_port};
             recovery_observations_.erase(key);
             const auto it = event_report_intents_.find(key);
-            if (it != event_report_intents_.end() && it->second.type != EventReportIntentType::kStaleSnapshot) {
+            // A liveness callback publishes DownHost before its
+            // generation-checked unregister. An event from that same active
+            // lifecycle must not erase the intent in this window. Only a
+            // strictly newer REGISTER/recovery lifecycle invalidates it.
+            if (it != event_report_intents_.end() && it->second.type != EventReportIntentType::kStaleSnapshot &&
+                it->second.lifecycle_generation < active_lifecycle_generation) {
                 canceled_type = it->second.type;
                 event_report_intents_.erase(it);
                 canceled = true;
@@ -824,6 +830,14 @@ bool CacheGarbageCollector::RunEventReportTick() {
     for (const auto &[instance_id, _] : event_report_retry_batches_) {
         active_instances.insert(instance_id);
     }
+    // A pass owns its frozen intent snapshot until its cursor reaches base.
+    // Keep scheduling it even if every live intent is canceled mid-pass;
+    // otherwise a later intent would inherit the stale cursor and barrier.
+    for (const auto &[instance_id, state] : event_report_scan_states_) {
+        if (state.context) {
+            active_instances.insert(instance_id);
+        }
+    }
     if (active_instances.empty()) {
         UpdateEventReportMetrics();
         return false;
@@ -965,6 +979,11 @@ bool CacheGarbageCollector::BeginEventReportPass(const std::string &instance_id,
         return false;
     }
 
+    auto indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+    if (!indexer || !indexer->IsMaintenanceDeleteReady()) {
+        FailEventReportPass(instance_id, state, indexer ? "meta_recovering" : "indexer_missing");
+        return false;
+    }
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher || !meta_searcher->SyncAllForMaintenance()) {
         FailEventReportPass(instance_id, state, meta_searcher ? "sync_all" : "searcher_missing");
@@ -1094,7 +1113,8 @@ std::vector<CacheGarbageCollector::EventReportDeleteTarget> CacheGarbageCollecto
                     if (backend->ParseLocationId(location_id, medium, host)) {
                         const EventReportIntentKey key{instance_id, location->type(), host};
                         if (backend->IsNodeRegistered(instance_id, host)) {
-                            CancelHostCleanupIntent(instance_id, location->type(), host);
+                            CancelHostCleanupIntent(
+                                instance_id, location->type(), host, backend->GetNodeGeneration(instance_id, host));
                         } else {
                             std::lock_guard<std::mutex> lock(event_report_intent_mutex_);
                             recovery_observations_.try_emplace(
@@ -1297,6 +1317,8 @@ bool CacheGarbageCollector::ExecuteEventReportDeleteBatch(const std::string &ins
             static_cast<double>(std::max<int64_t>(0, action_duration_ms));
         metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_wait_us") =
             static_cast<double>(std::max<int64_t>(0, result.shard_lock_wait_time_us));
+        metrics_registry_->GetGauge("cache_gc.event_report_last_action_shard_lock_hold_us") =
+            static_cast<double>(std::max<int64_t>(0, result.shard_lock_hold_time_us));
     } catch (...) { KVCM_LOG_ERROR("cache gc failed to record event report action metrics"); }
 
     if (!result.sync_succeeded || (result.ec != EC_OK && result.ec != EC_MISMATCH)) {

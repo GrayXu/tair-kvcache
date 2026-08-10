@@ -185,6 +185,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, event_report_last_pass_duration_ms);
     DECLARE_METRICS(cache_gc, event_report_last_action_duration_ms);
     DECLARE_METRICS(cache_gc, event_report_last_action_shard_lock_wait_us);
+    DECLARE_METRICS(cache_gc, event_report_last_action_shard_lock_hold_us);
     DECLARE_METRICS(cache_gc, event_report_sync_retry_batch_count);
 
     // cache manager
@@ -475,6 +476,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, event_report_last_pass_duration_ms);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_last_action_duration_ms);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_last_action_shard_lock_wait_us);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_last_action_shard_lock_hold_us);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_sync_retry_batch_count);
 
     // cache manager
@@ -882,6 +884,8 @@ void KmonitorMetricsReporter::ReportInterval() {
                                "cache_gc.event_report_last_action_duration_ms");
         report_registry_metric(ctx_->cache_gc_event_report_last_action_shard_lock_wait_us_metrics.get(),
                                "cache_gc.event_report_last_action_shard_lock_wait_us");
+        report_registry_metric(ctx_->cache_gc_event_report_last_action_shard_lock_hold_us_metrics.get(),
+                               "cache_gc.event_report_last_action_shard_lock_hold_us");
         report_registry_metric(ctx_->cache_gc_event_report_sync_retry_batch_count_metrics.get(),
                                "cache_gc.event_report_sync_retry_batch_count");
     } while (false);
