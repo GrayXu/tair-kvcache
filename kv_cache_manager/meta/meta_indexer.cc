@@ -919,6 +919,23 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                                                   const KeyVector &keys,
                                                   const LocationIdRefVector &location_ids,
                                                   const SingleLocationModifierFunc &modifier) noexcept {
+    return ReadModifyWriteSingleTargetLocationsImpl(request_context, keys, location_ids, modifier, false);
+}
+
+MetaIndexer::SingleLocationResult
+MetaIndexer::ReadModifyWriteSingleTargetLocationsWithDelete(RequestContext *request_context,
+                                                            const KeyVector &keys,
+                                                            const LocationIdRefVector &location_ids,
+                                                            const SingleLocationModifierFunc &modifier) noexcept {
+    return ReadModifyWriteSingleTargetLocationsImpl(request_context, keys, location_ids, modifier, true);
+}
+
+MetaIndexer::SingleLocationResult
+MetaIndexer::ReadModifyWriteSingleTargetLocationsImpl(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const LocationIdRefVector &location_ids,
+                                                      const SingleLocationModifierFunc &modifier,
+                                                      bool enable_delete) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return SingleLocationResult(EC_OK);
@@ -1029,10 +1046,57 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     upsert_is_new_key.reserve(max_batch_size);
     upsert_read_indices.reserve(max_batch_size);
 
+    struct DeleteState {
+        DeleteState(size_t key_count, size_t max_batch_size) : result(key_count) {
+            batch.batch_keys.reserve(max_batch_size);
+            batch.batch_indexs.reserve(max_batch_size);
+            batch.batch_location_ids.reserve(max_batch_size);
+            prepared_location_ids.reserve(max_batch_size);
+        }
+
+        Result result;
+        BatchMetaData batch;
+        LocationIdsPerKey prepared_location_ids;
+    };
+    std::unique_ptr<DeleteState> delete_state;
+    if (enable_delete) {
+        delete_state = std::make_unique<DeleteState>(keys.size(), max_batch_size);
+    }
+
     struct DeferredLocationRelease {
         CacheLocationVector &locations;
         ~DeferredLocationRelease() { locations.clear(); }
     };
+
+    // The caller releases every retained read handle before entering this
+    // helper. It still runs under ScopedBatchLock so location deletion, empty
+    // key reclamation, and key_count adjustment remain one RMW critical section.
+    auto execute_delete_batch =
+        [this, &trace_id, &keys, &result, &delete_state, &key_level_failures, &stats]() {
+            if (!delete_state) {
+                return;
+            }
+            auto &batch = delete_state->batch;
+            if (batch.batch_keys.empty()) {
+                return;
+            }
+            stats.delete_key_count += static_cast<int64_t>(batch.batch_keys.size());
+            const int64_t begin_delete = TimestampUtil::GetCurrentTimeUs();
+            int32_t reclaimed_count = 0;
+            const std::vector<ErrorCode> delete_ecs =
+                backend_manager_->Delete(nullptr, batch.batch_keys, batch.batch_location_ids, reclaimed_count);
+            stats.delete_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_delete;
+
+            ProcessErrorCodes(
+                trace_id, delete_ecs, batch.batch_indexs, keys, kRmwDeleteMetaOperation, delete_state->result);
+            for (const int32_t global_index : batch.batch_indexs) {
+                result.error_codes[global_index] = delete_state->result.error_codes[global_index];
+                if (delete_state->result.error_codes[global_index] != EC_OK) {
+                    key_level_failures[global_index] = true;
+                }
+            }
+            AdjustKeyCountMeta(-reclaimed_count);
+        };
 
     for (const auto &batch : batches) {
         // Reuse request-shaped buffers across internal batches. Clear happens
@@ -1049,9 +1113,18 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         upsert_global_indices.clear();
         upsert_is_new_key.clear();
         upsert_read_indices.clear();
+        if (delete_state) {
+            delete_state->batch.batch_keys.clear();
+            delete_state->batch.batch_indexs.clear();
+            delete_state->batch.batch_location_ids.clear();
+            delete_state->prepared_location_ids.clear();
+        }
         for (const int32_t global_index : batch.global_indices) {
             batch_keys.push_back(keys[global_index]);
             batch_location_ids.push_back(location_ids[global_index]);
+            if (delete_state) {
+                delete_state->prepared_location_ids.push_back({*location_ids[global_index]});
+            }
         }
         // Allocate all request-shaped scratch vectors before taking metadata
         // shard locks. Large ReportEvent requests otherwise extend every lock
@@ -1140,6 +1213,14 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                 upsert_global_indices.push_back(global_index);
                 upsert_is_new_key.push_back(key_get_ec == EC_NOENT);
                 upsert_read_indices.push_back(i);
+            } else if (action == MA_DELETE && enable_delete) {
+                result.error_codes[global_index] = modifier_ec;
+                if (modifier_ec == EC_OK) {
+                    delete_state->batch.batch_keys.push_back(batch_keys[i]);
+                    delete_state->batch.batch_indexs.push_back(global_index);
+                    delete_state->batch.batch_location_ids.push_back(
+                        std::move(delete_state->prepared_location_ids[i]));
+                }
             } else {
                 if (action == MA_OK && modifier_ec != EC_OK) {
                     action = MA_SKIP;
@@ -1158,6 +1239,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         stats.update_key_count += static_cast<int64_t>(upsert_keys.size() - new_key_count);
         if (upsert_keys.empty()) {
             backend_scratch.ReleaseRetainedHandles();
+            execute_delete_batch();
             continue;
         }
 
@@ -1245,6 +1327,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                         ERROR, "single target RMW upsert failed, key[%ld], ec[%d]", keys[global_index], ec);
                 }
             }
+            execute_delete_batch();
             continue;
         }
 
@@ -1268,6 +1351,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
             }
         }
         AdjustKeyCountMeta(successful_new_keys);
+        execute_delete_batch();
     }
 
     EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());

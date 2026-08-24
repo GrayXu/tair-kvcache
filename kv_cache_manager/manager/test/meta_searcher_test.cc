@@ -235,6 +235,36 @@ private:
     std::vector<KeyTypeVec> requested_key_batches_;
 };
 
+class RecordingDeleteRmwBackend : public MetaLocalBackend {
+public:
+    void Reset() {
+        targeted_get_calls_ = 0;
+        delete_locations_calls_ = 0;
+    }
+
+    size_t TargetedGetCalls() const { return targeted_get_calls_; }
+    size_t DeleteLocationsCalls() const { return delete_locations_calls_; }
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations) noexcept override {
+        ++targeted_get_calls_;
+        return MetaLocalBackend::GetLocations(request_context, keys, location_ids, out_locations);
+    }
+
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids) noexcept override {
+        ++delete_locations_calls_;
+        return MetaLocalBackend::DeleteLocations(request_context, keys, location_ids);
+    }
+
+private:
+    size_t targeted_get_calls_ = 0;
+    size_t delete_locations_calls_ = 0;
+};
+
 class PrefixReadBackend : public MetaLocalBackend {
 public:
     void SetFailedKey(std::optional<KeyType> key) { failed_key_ = key; }
@@ -384,6 +414,18 @@ public:
         EXPECT_EQ(EC_OK, backend->Open());
         auto backend_raw = backend.get();
         meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    RecordingDeleteRmwBackend *ReplaceWithRecordingDeleteRmwBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<RecordingDeleteRmwBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        EXPECT_EQ(EC_OK, meta_indexer_->backend_manager_->persistent_backend_->Close());
         meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
         meta_indexer_->backend_manager_->cache_backend_.reset();
         return backend_raw;
@@ -2125,7 +2167,10 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     }};
     std::vector<ErrorCode> per_key_ec;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
 
+    // One location task and one spec_name use the pure-local fast path even
+    // when the stored location has sibling specs to preserve.
     std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
         {location_id, {"linear_0"}},
     }};
@@ -2147,7 +2192,9 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
     EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
     EXPECT_TRUE(location_maps[0].at(location_id)->HasValidatedLocationSpecs());
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
 
+    // Multiple spec_names are deliberately left on the generic RMW path.
     delete_tasks = {{
         {location_id, {"linear_1", "full_3"}},
     }};
@@ -2158,6 +2205,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_TRUE(location_maps[0].empty());
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
 
     delete_tasks = {{
         {location_id, {}},
@@ -2170,6 +2218,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_FALSE(location_maps[0].empty());
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteFinalLocationsReclaimsDuplicateKeyOnce) {
@@ -2200,6 +2249,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteFinalLocationsReclaimsDuplicateKeyOnce) 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key_ec);
     ASSERT_EQ(2u, meta_indexer_->GetKeyCount());
 
+    // Two locations for one key must remain on the generic RMW path, which
+    // reclaims and accounts for the now-empty key only once.
     std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
         {location_a, {"tp0"}},
         {location_b, {"tp1"}},
@@ -2219,6 +2270,36 @@ TEST_F(MetaSearcherTest, TestBatchDeleteFinalLocationsReclaimsDuplicateKeyOnce) 
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_TRUE(location_maps[0].empty());
     EXPECT_EQ(1u, location_maps[1].count(retained_location));
+}
+
+TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsFallsBackForNonPureBackend) {
+    auto *backend = ReplaceWithRecordingDeleteRmwBackend();
+    ASSERT_NE(nullptr, backend);
+    ASSERT_FALSE(meta_indexer_->SupportsSingleLocationRmw());
+
+    const KeyVector keys = {10016};
+    const std::string location_id = "event_report#mem#generic-delete:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("tp0", "event_report://generic-delete:8080/mem?size=1")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    backend->Reset();
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
+        {location_id, {"tp0"}},
+    }};
+    std::vector<std::vector<ErrorCode>> delete_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ(1u, backend->TargetedGetCalls());
+    EXPECT_EQ(1u, backend->DeleteLocationsCalls());
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsValidatesShapeAndMissingLocationIsIdempotent) {

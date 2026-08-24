@@ -126,6 +126,15 @@ public:
                                                               const KeyVector &keys,
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
+    // DELETE variant of the same pure-local fast path. This entry point
+    // explicitly extends SingleLocationModifierFunc's targeted-upsert action
+    // contract with MA_DELETE and allocates delete-specific scratch before shard
+    // locks are acquired; the entry point above retains its existing contract.
+    SingleLocationResult ReadModifyWriteSingleTargetLocationsWithDelete(
+        RequestContext *request_context,
+        const KeyVector &keys,
+        const LocationIdRefVector &location_ids,
+        const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
 
     // ---------- READ ----------
@@ -206,6 +215,11 @@ private:
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
                                                bool refresh_cache_from_persistent) noexcept;
+    SingleLocationResult ReadModifyWriteSingleTargetLocationsImpl(RequestContext *request_context,
+                                                                  const KeyVector &keys,
+                                                                  const LocationIdRefVector &location_ids,
+                                                                  const SingleLocationModifierFunc &modifier,
+                                                                  bool enable_delete) noexcept;
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;
