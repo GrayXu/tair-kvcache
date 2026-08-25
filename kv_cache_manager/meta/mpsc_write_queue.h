@@ -15,6 +15,7 @@ namespace kv_cache_manager {
 enum class WriteOpType {
     kPut,
     kUpsert,
+    kUpsertSingleLocation,
     kDelete,
     kDeleteLocations,
 };
@@ -24,6 +25,7 @@ struct WriteOp {
     KeyTypeVec keys;
     FieldMapVec field_maps;
     CacheLocationMapVector locations;
+    CacheLocationVector single_locations;
     std::vector<std::vector<std::string>> field_names_vec;
 
     WriteOp() = default;

@@ -193,6 +193,23 @@ TEST_F(MetaAsyncRedisBackendTest, TestUpsert) {
     }
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestUpsertSingleLocationsValidatesAlignedInputs) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    const std::string first_id = "first";
+    const std::string second_id = "second";
+    auto first = std::make_shared<CacheLocation>();
+    first->set_id(first_id);
+    auto second = std::make_shared<CacheLocation>();
+    second->set_id(second_id);
+
+    EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {}, {first}), ElementsAre(EC_BADARGS));
+    EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {&first_id}, {}), ElementsAre(EC_BADARGS));
+    EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {nullptr}, {first}), ElementsAre(EC_BADARGS));
+    EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {&first_id}, {nullptr}), ElementsAre(EC_BADARGS));
+    EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {&second_id}, {first}), ElementsAre(EC_BADARGS));
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestDelete) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
@@ -331,8 +348,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsert) {
     op.type = WriteOpType::kUpsert;
     op.keys = {20};
     op.field_maps = {{{"property", "value"}}};
-    op.locations = {
-        {{"location", std::make_shared<TrackingCacheLocation>(serialize_count, "upsert-location-json")}}};
+    op.locations = {{{"first", std::make_shared<TrackingCacheLocation>(serialize_count, "first-location-json")},
+                     {"second", std::make_shared<TrackingCacheLocation>(serialize_count, "second-location-json")}}};
 
     std::vector<CmdArgs> cmds;
     backend_->CompileWriteOp(op, cmds);
@@ -340,13 +357,39 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsert) {
     EXPECT_THAT(cmds,
                 ElementsAre(ElementsAre("HSET",
                                         "kvcache:instance_test_instance:cache_20",
-                                        "L#location",
-                                        "upsert-location-json",
+                                        "L#first",
+                                        "first-location-json",
+                                        "L#second",
+                                        "second-location-json",
                                         "property",
                                         "value")));
-    EXPECT_EQ(1, serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
     EXPECT_TRUE(op.field_maps.empty());
     EXPECT_TRUE(op.locations.empty());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsertSingleLocation) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    std::atomic<int> serialize_count{0};
+    auto first = std::make_shared<TrackingCacheLocation>(serialize_count, "first-json");
+    first->set_id("first");
+    auto second = std::make_shared<TrackingCacheLocation>(serialize_count, "second-json");
+    second->set_id("second");
+    WriteOp op;
+    op.type = WriteOpType::kUpsertSingleLocation;
+    op.keys = {30, 31};
+    op.single_locations = {first, second};
+
+    std::vector<CmdArgs> cmds;
+    backend_->CompileWriteOp(op, cmds);
+
+    EXPECT_THAT(cmds,
+                ElementsAre(ElementsAre("HSET", "kvcache:instance_test_instance:cache_30", "L#first", "first-json"),
+                            ElementsAre(
+                                "HSET", "kvcache:instance_test_instance:cache_31", "L#second", "second-json")));
+    EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
+    EXPECT_TRUE(op.single_locations.empty());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
@@ -466,13 +509,24 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwned
         properties[0]["upsert_property"] = "mutated-upsert-value";
     }
 
+    std::atomic<int> single_serialize_count{0};
+    {
+        const std::string location_id = "single";
+        auto location = std::make_shared<TrackingCacheLocation>(single_serialize_count, "single-location-json");
+        location->set_id(location_id);
+        EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {103}, {&location_id}, {location}), ElementsAre(EC_OK));
+        location.reset();
+    }
+
     EXPECT_EQ(0, put_serialize_count.load(std::memory_order_relaxed));
     EXPECT_EQ(0, upsert_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, single_serialize_count.load(std::memory_order_relaxed));
 
     can_proceed.store(true, std::memory_order_release);
-    EXPECT_TRUE(backend_->Sync({101, 102}));
+    EXPECT_TRUE(backend_->Sync({101, 102, 103}));
     EXPECT_EQ(1, put_serialize_count.load(std::memory_order_relaxed));
     EXPECT_EQ(1, upsert_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, single_serialize_count.load(std::memory_order_relaxed));
 
     std::vector<CmdArgs> actual_cmds;
     {
@@ -492,7 +546,11 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwned
                                         "L#upsert",
                                         "upsert-location-json",
                                         "upsert_property",
-                                        "upsert-value")));
+                                        "upsert-value"),
+                            ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_103",
+                                        "L#single",
+                                        "single-location-json")));
     EXPECT_EQ(EC_OK, backend_->Close());
 }
 
@@ -510,6 +568,62 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetQueueIndexForKey) {
     int q1 = backend_->GetQueueIndexForKey(42);
     int q2 = backend_->GetQueueIndexForKey(42);
     ASSERT_EQ(q1, q2);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestUpsertSingleLocationsPreservesMultiQueueAlignmentAndOwnership) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=3&async_max_batch=64"
+                           "&async_wait_us=1000&async_max_size=1000&async_enqueue_timeout_ms=0");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    backend_->queues_.resize(backend_->queue_count_);
+    for (auto &queue : backend_->queues_) {
+        queue = std::make_unique<MpscWriteQueue>();
+    }
+
+    const KeyTypeVec keys = {11, 12, 13, 14, 15, 16, 17, 18};
+    std::vector<std::string> location_ids;
+    CacheLocationVector locations;
+    LocationIdRefVector location_id_refs;
+    location_ids.reserve(keys.size());
+    locations.reserve(keys.size());
+    location_id_refs.reserve(keys.size());
+    for (const KeyType key : keys) {
+        location_ids.push_back("location-" + std::to_string(key));
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(location_ids.back());
+        locations.push_back(std::move(location));
+        location_id_refs.push_back(&location_ids.back());
+    }
+
+    std::vector<KeyTypeVec> expected_keys(backend_->queue_count_);
+    std::vector<std::vector<std::string>> expected_ids(backend_->queue_count_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const int queue_id = backend_->GetQueueIndexForKey(keys[i]);
+        expected_keys[queue_id].push_back(keys[i]);
+        expected_ids[queue_id].push_back(location_ids[i]);
+    }
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              backend_->UpsertSingleLocations(nullptr, keys, location_id_refs, locations));
+    location_id_refs.clear();
+    location_ids.clear();
+    locations.clear();
+
+    for (int queue_id = 0; queue_id < backend_->queue_count_; ++queue_id) {
+        int64_t taken_keys = 0;
+        auto items = backend_->queues_[queue_id]->PopBatch(64, taken_keys);
+        if (expected_keys[queue_id].empty()) {
+            EXPECT_TRUE(items.empty());
+            continue;
+        }
+        ASSERT_EQ(1u, items.size());
+        auto &op = std::get<WriteOp>(items.front());
+        EXPECT_EQ(expected_keys[queue_id], op.keys);
+        ASSERT_EQ(expected_ids[queue_id].size(), op.single_locations.size());
+        for (size_t i = 0; i < expected_ids[queue_id].size(); ++i) {
+            ASSERT_TRUE(op.single_locations[i]);
+            EXPECT_EQ(expected_ids[queue_id][i], op.single_locations[i]->id());
+        }
+    }
 }
 
 // ==================== Prefix Tests ====================

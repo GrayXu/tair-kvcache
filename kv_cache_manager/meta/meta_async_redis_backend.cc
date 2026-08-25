@@ -248,6 +248,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             sub_op.field_maps.reserve(indices.size());
             sub_op.locations.reserve(indices.size());
         }
+        if (!op.single_locations.empty()) {
+            sub_op.single_locations.reserve(indices.size());
+        }
         if (!op.field_names_vec.empty()) {
             sub_op.field_names_vec.reserve(indices.size());
         }
@@ -256,6 +259,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             if (!op.field_maps.empty()) {
                 sub_op.field_maps.push_back(std::move(op.field_maps[idx]));
                 sub_op.locations.push_back(std::move(op.locations[idx]));
+            }
+            if (!op.single_locations.empty()) {
+                sub_op.single_locations.push_back(std::move(op.single_locations[idx]));
             }
             if (!op.field_names_vec.empty()) {
                 sub_op.field_names_vec.push_back(std::move(op.field_names_vec[idx]));
@@ -306,6 +312,26 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
     op.keys = keys;
     op.field_maps = properties;
     op.locations = locations;
+    return EnqueueWriteOp(request_context, std::move(op));
+}
+
+std::vector<ErrorCode> MetaAsyncRedisBackend::UpsertSingleLocations(RequestContext *request_context,
+                                                                    const KeyTypeVec &keys,
+                                                                    const LocationIdRefVector &location_ids,
+                                                                    const CacheLocationVector &locations) noexcept {
+    if (keys.size() != location_ids.size() || keys.size() != locations.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i] == nullptr || !locations[i] || locations[i]->id() != *location_ids[i]) {
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+    }
+
+    WriteOp op;
+    op.type = WriteOpType::kUpsertSingleLocation;
+    op.keys = keys;
+    op.single_locations = locations;
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
@@ -726,6 +752,21 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
 }
 
 void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds) {
+    if (op.type == WriteOpType::kUpsertSingleLocation) {
+        for (size_t i = 0; i < op.keys.size(); ++i) {
+            const auto &location = op.single_locations[i];
+            CmdArgs command;
+            command.reserve(4);
+            command.emplace_back("HSET");
+            command.emplace_back(cache_key_prefix_ + std::to_string(op.keys[i]));
+            command.emplace_back(PROPERTY_LOCATION_PREFIX + location->id());
+            command.emplace_back(location->ToJsonString());
+            cmds.emplace_back(std::move(command));
+        }
+        op.single_locations.clear();
+        return;
+    }
+
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, op.keys);
 
     switch (op.type) {
@@ -741,6 +782,9 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
         }
         RedisClient::BuildHashSetCmds(full_keys, op.field_maps, cmds);
         break;
+    case WriteOpType::kUpsertSingleLocation:
+        // Handled by the direct four-argument HSET path above.
+        break;
     case WriteOpType::kDelete:
         RedisClient::BuildDeleteCmds(full_keys, cmds);
         break;
@@ -749,6 +793,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
         break;
     }
     op.locations.clear();
+    op.single_locations.clear();
     op.field_maps.clear();
 }
 

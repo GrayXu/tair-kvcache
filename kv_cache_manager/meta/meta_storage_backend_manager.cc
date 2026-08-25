@@ -694,13 +694,40 @@ void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
     // Borrowed views are dead after modifier evaluation. Release the matching
     // lookup plan before persistent enqueue can wait for queue capacity.
     scratch.ReleaseRetainedHandles();
+    std::vector<ErrorCode> persistent_results =
+        persistent_backend_->UpsertSingleLocations(request_context, keys, location_ids, locations);
+    if (persistent_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("persistent single-location Upsert results[%lu] mismatch keys[%lu]",
+                       persistent_results.size(),
+                       keys.size());
+        out_results.assign(keys.size(), EC_ERROR);
+        return;
+    }
+
     scratch.write_locations.resize(keys.size());
     scratch.write_properties.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         scratch.write_locations[i].clear();
-        scratch.write_locations[i].emplace(*location_ids[i], std::move(locations[i]));
+        scratch.write_properties[i].clear();
+        if (persistent_results[i] == EC_OK) {
+            scratch.write_locations[i].emplace(*location_ids[i], std::move(locations[i]));
+        }
     }
-    out_results = UpsertPrepared(request_context, keys, scratch.write_locations, scratch.write_properties);
+
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    out_results = cache_backend_->UpsertConsume(
+        request_context, keys, scratch.write_locations, scratch.write_properties, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    if (out_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("cache single-location Upsert results[%lu] mismatch keys[%lu]",
+                       out_results.size(),
+                       keys.size());
+        out_results.assign(keys.size(), EC_ERROR);
+    }
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,

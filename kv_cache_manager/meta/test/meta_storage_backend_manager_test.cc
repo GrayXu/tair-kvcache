@@ -405,6 +405,31 @@ public:
         FAIL() << "recover did not finish in time";
     }
 
+    static std::unique_ptr<MetaAsyncRedisBackend>
+    MakeQueuedAsyncBackend(const std::string &instance_id, int queue_count, int queue_max_size) {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageType(META_ASYNC_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageUri("redis://host:6379/?async_queue_count=" + std::to_string(queue_count) +
+                              "&async_max_size=" + std::to_string(queue_max_size) +
+                              "&async_enqueue_timeout_ms=0");
+        auto backend = std::make_unique<MetaAsyncRedisBackend>();
+        EXPECT_EQ(EC_OK, backend->Init(instance_id, config));
+        backend->queues_.resize(queue_count);
+        for (auto &queue : backend->queues_) {
+            queue = std::make_unique<MpscWriteQueue>();
+        }
+        return backend;
+    }
+
+    static std::unique_ptr<MetaLocalBackend> MakeOpenLocalBackend(const std::string &instance_id) {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageType(META_LOCAL_BACKEND_TYPE_STR);
+        auto backend = std::make_unique<MetaLocalBackend>();
+        EXPECT_EQ(EC_OK, backend->Init(instance_id, config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        return backend;
+    }
+
 protected:
     std::shared_ptr<RequestContext> request_context_;
 };
@@ -579,6 +604,87 @@ TEST_F(MetaStorageBackendManagerTest, TestConcurrentLocationValueReadsAreLocalOn
     mgr.persistent_backend_ = std::make_unique<MetaDummyBackend>();
     EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
     EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestCachedSingleLocationRmwCommitsOnlyAdmittedKeys) {
+    MetaStorageBackendManager mgr;
+    auto persistent = MakeQueuedAsyncBackend("cached_partial", /*queue_count=*/2, /*queue_max_size=*/2);
+    auto *persistent_raw = persistent.get();
+    auto cache = MakeOpenLocalBackend("cached_partial");
+    auto *cache_raw = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    KeyType rejected_key = -1;
+    KeyType accepted_key_1 = -1;
+    KeyType accepted_key_2 = -1;
+    for (KeyType key = 1; key < 100 && (rejected_key < 0 || accepted_key_1 < 0 || accepted_key_2 < 0); ++key) {
+        if (persistent_raw->GetQueueIndexForKey(key) == 0) {
+            if (rejected_key < 0) {
+                rejected_key = key;
+            }
+        } else if (accepted_key_1 < 0) {
+            accepted_key_1 = key;
+        } else if (accepted_key_2 < 0) {
+            accepted_key_2 = key;
+        }
+    }
+    ASSERT_GE(rejected_key, 0);
+    ASSERT_GE(accepted_key_1, 0);
+    ASSERT_GE(accepted_key_2, 0);
+
+    WriteOp filler;
+    filler.type = WriteOpType::kDelete;
+    filler.keys = {-1, -2};
+    persistent_raw->queues_[0]->Push(QueueItem{std::move(filler)});
+
+    const KeyVector keys = {accepted_key_1, rejected_key, accepted_key_2};
+    const std::string target_id = "target";
+    CacheLocationMapVector seed_locations(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        seed_locations[i].emplace(target_id, MakeLocation(target_id, "old-" + std::to_string(i)));
+    }
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              cache_raw->Put(nullptr, keys, seed_locations, PropertyMapVector(keys.size())));
+
+    SingleLocationRmwScratch scratch;
+    mgr.PrepareSingleLocationRmwScratch(keys.size(), scratch);
+    CacheLocationViewVector old_locations;
+    std::vector<ErrorCode> key_results;
+    std::vector<ErrorCode> read_results;
+    mgr.GetSingleLocationViewsWithKeyStatusInto(request_context_.get(),
+                                                keys,
+                                                {&target_id, &target_id, &target_id},
+                                                old_locations,
+                                                key_results,
+                                                read_results,
+                                                scratch);
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), read_results);
+    ASSERT_TRUE(scratch.HasRetainedHandles());
+
+    CacheLocationVector replacements = {MakeLocation(target_id, "new-0"),
+                                        MakeLocation(target_id, "new-1"),
+                                        MakeLocation(target_id, "new-2")};
+    std::vector<ErrorCode> write_results;
+    mgr.UpsertSingleLocationsUsingRetainedHandlesInto(request_context_.get(),
+                                                       keys,
+                                                       {&target_id, &target_id, &target_id},
+                                                       replacements,
+                                                       {0, 1, 2},
+                                                       write_results,
+                                                       scratch);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT, EC_OK}), write_results);
+    EXPECT_FALSE(scratch.HasRetainedHandles());
+
+    CacheLocationMapVector stored_locations;
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              cache_raw->GetLocations(nullptr, keys, stored_locations));
+    EXPECT_EQ("new-0", stored_locations[0].at(target_id)->location_specs().front().uri());
+    EXPECT_EQ("old-1", stored_locations[1].at(target_id)->location_specs().front().uri());
+    EXPECT_EQ("new-2", stored_locations[2].at(target_id)->location_specs().front().uri());
+
+    EXPECT_EQ(EC_OK, mgr.cache_backend_->Close());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestPureLocalHashSeedIsNotExposedForCachedOrNonLocalBackends) {

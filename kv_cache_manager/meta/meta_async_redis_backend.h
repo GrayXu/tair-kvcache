@@ -34,6 +34,10 @@ public:
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                 const KeyTypeVec &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 const CacheLocationVector &locations) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
                                            const KeyTypeVec &keys,
