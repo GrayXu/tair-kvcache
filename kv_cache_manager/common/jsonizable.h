@@ -154,6 +154,9 @@ private:
     template <typename T, typename C, typename A>
     static void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer,
                               const std::map<std::string, T, C, A> &values);
+
+    // Exposed to unit tests through -fno-access-control; not a public API.
+    static size_t GetThreadLocalJsonBufferCapacityForTest() noexcept;
 };
 
 template <typename T>

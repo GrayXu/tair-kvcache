@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/unittest.h"
 
@@ -13,6 +16,41 @@ enum class EnumClass {
     EC_1 = 1,
     EC_2 = 2,
     EC_3 = 3,
+};
+
+class MutableStringJson : public Jsonizable {
+public:
+    explicit MutableStringJson(std::string value) : value_(std::move(value)) {}
+
+    void SetValue(std::string value) { value_ = std::move(value); }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "value", value_);
+    }
+
+private:
+    std::string value_;
+};
+
+class ReentrantJson : public Jsonizable {
+public:
+    explicit ReentrantJson(const Jsonizable &nested) : nested_(nested) {}
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "nested_json", nested_.ToJsonString());
+    }
+
+private:
+    const Jsonizable &nested_;
+};
+
+class OverrideJson : public Jsonizable {
+public:
+    std::string ToJsonString() const noexcept override { return "custom-json"; }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "unused", true);
+    }
 };
 
 class JsonClass : public Jsonizable {
@@ -517,6 +555,76 @@ TEST_F(JsonizableTest, TestToJsonString) {
                               "\"inner_int_value\":3,\"inner_string_value\":\"3\",\"inner_int_values\":[31,32,33]}]"),
                   Jsonizable::ToJsonString(v));
     }
+}
+
+TEST_F(JsonizableTest, TestToJsonStringScratchClearsDifferentSizedPayloads) {
+    MutableStringJson value("first");
+    EXPECT_EQ("{\"value\":\"first\"}", value.ToJsonString());
+
+    value.SetValue(std::string(12 * 1024, 'm'));
+    const std::string reserved_oversized = value.ToJsonString();
+    EXPECT_LT(reserved_oversized.size(), 64u * 1024u);
+    EXPECT_EQ(0u, Jsonizable::GetThreadLocalJsonBufferCapacityForTest());
+
+    value.SetValue(std::string(70 * 1024, 'x'));
+    const std::string oversized = value.ToJsonString();
+    EXPECT_EQ(std::string("{\"value\":\"") + std::string(70 * 1024, 'x') + "\"}", oversized);
+    EXPECT_EQ(0u, Jsonizable::GetThreadLocalJsonBufferCapacityForTest());
+
+    value.SetValue("quote\" slash\\ newline\n中文");
+    EXPECT_EQ("{\"value\":\"quote\\\" slash\\\\ newline\\n中文\"}", value.ToJsonString());
+    EXPECT_GT(Jsonizable::GetThreadLocalJsonBufferCapacityForTest(), 0u);
+    EXPECT_LE(Jsonizable::GetThreadLocalJsonBufferCapacityForTest(), 64u * 1024u);
+}
+
+TEST_F(JsonizableTest, TestToJsonStringScratchSupportsReentrancyAndOverrides) {
+    MutableStringJson nested("inner");
+    ReentrantJson outer(nested);
+    EXPECT_EQ("{\"nested_json\":\"{\\\"value\\\":\\\"inner\\\"}\"}", outer.ToJsonString());
+
+    OverrideJson override_value;
+    const Jsonizable &overridden = override_value;
+    EXPECT_EQ("custom-json", overridden.ToJsonString());
+}
+
+TEST_F(JsonizableTest, TestToJsonStringScratchIsThreadLocal) {
+    constexpr size_t kThreadCount = 8;
+    constexpr size_t kIterations = 512;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([i, &ready, &start, &failed]() {
+            MutableStringJson value("");
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (size_t iteration = 0; iteration < kIterations; ++iteration) {
+                size_t payload_size = 1 + ((i + 1) * (iteration + 17)) % 257;
+                if (iteration % 128 == 0) {
+                    payload_size = 70 * 1024 + i;
+                }
+                const std::string payload = "thread-" + std::to_string(i) + "-" +
+                                            std::string(payload_size, static_cast<char>('a' + i));
+                value.SetValue(payload);
+                if (value.ToJsonString() != "{\"value\":\"" + payload + "\"}") {
+                    failed.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    EXPECT_FALSE(failed.load(std::memory_order_acquire));
 }
 
 TEST_F(JsonizableTest, TestFromJsonString) {
