@@ -1,4 +1,5 @@
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -463,6 +464,22 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
     }
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeletePreservesSignedKeyBytes) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    WriteOp op;
+    op.type = WriteOpType::kDelete;
+    op.keys = {std::numeric_limits<KeyType>::min(), -1, std::numeric_limits<KeyType>::max()};
+
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+
+    EXPECT_THAT(scratch.all_cmds,
+                ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_-9223372036854775808"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_-1"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_9223372036854775807")));
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteLocations) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
@@ -551,17 +568,24 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchRecyclesCompactCommandStora
     ASSERT_EQ(1u, scratch.all_cmds.size());
     ASSERT_EQ(4u, scratch.all_cmds[0].size());
     auto *const first_storage = scratch.all_cmds[0].data();
+    const char *const first_key_storage = scratch.all_cmds[0][1].data();
+    const size_t first_key_capacity = scratch.all_cmds[0][1].capacity();
 
     scratch.ResetForPop();
     ASSERT_EQ(1u, scratch.recycled_cmds.size());
-    EXPECT_TRUE(scratch.recycled_cmds[0].empty());
+    ASSERT_EQ(2u, scratch.recycled_cmds[0].size());
+    EXPECT_TRUE(scratch.recycled_cmds[0][0].empty());
+    EXPECT_TRUE(scratch.recycled_cmds[0][1].empty());
     EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
+    EXPECT_EQ(first_key_storage, scratch.recycled_cmds[0][1].data());
+    EXPECT_EQ(first_key_capacity, scratch.recycled_cmds[0][1].capacity());
 
     auto second_op = make_compact_op(82, "second", "second-json");
     backend_->CompileWriteOp(second_op, scratch);
     ASSERT_EQ(1u, scratch.all_cmds.size());
     EXPECT_TRUE(scratch.recycled_cmds.empty());
     EXPECT_EQ(first_storage, scratch.all_cmds[0].data());
+    EXPECT_EQ(first_key_storage, scratch.all_cmds[0][1].data());
     EXPECT_THAT(scratch.all_cmds[0],
                 ElementsAre("HSET", "kvcache:instance_test_instance:cache_82", "L#second", "second-json"));
     EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
@@ -584,7 +608,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelDelAndHset
 
     scratch.ResetForPop();
     ASSERT_EQ(1u, scratch.recycled_cmds.size());
-    EXPECT_TRUE(scratch.recycled_cmds[0].empty());
+    ASSERT_EQ(2u, scratch.recycled_cmds[0].size());
+    EXPECT_TRUE(scratch.recycled_cmds[0][0].empty());
+    EXPECT_TRUE(scratch.recycled_cmds[0][1].empty());
     EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
 
     WriteOp whole_delete_op;
@@ -598,6 +624,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelDelAndHset
 
     scratch.ResetForPop();
     ASSERT_EQ(1u, scratch.recycled_cmds.size());
+    ASSERT_EQ(2u, scratch.recycled_cmds[0].size());
+    EXPECT_TRUE(scratch.recycled_cmds[0][0].empty());
+    EXPECT_TRUE(scratch.recycled_cmds[0][1].empty());
     EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
 
     std::atomic<int> serialize_count{0};
@@ -635,7 +664,10 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchBoundsRecyclerAndRejectsOve
     ASSERT_EQ(MetaAsyncRedisBackend::ConsumerScratch::kRetainedRecycledCommandCount,
               bounded.recycled_cmds.size());
     for (const auto &command : bounded.recycled_cmds) {
-        EXPECT_TRUE(command.empty());
+        ASSERT_EQ(2u, command.size());
+        EXPECT_TRUE(command[0].empty());
+        EXPECT_TRUE(command[1].empty());
+        EXPECT_LE(command[1].capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedRedisKeyCapacity);
         EXPECT_LE(command.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
     }
 
@@ -650,6 +682,42 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchBoundsRecyclerAndRejectsOve
     oversized.all_cmds.emplace_back(std::move(multi_field_command));
     oversized.ResetForPop();
     EXPECT_TRUE(oversized.recycled_cmds.empty());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchReleasesOversizedRedisKeyCapacity) {
+    const std::string oversized_instance_id(
+        MetaAsyncRedisBackend::ConsumerScratch::kRetainedRedisKeyCapacity + 32, 'x');
+    ASSERT_EQ(EC_OK, backend_->Init(oversized_instance_id, config_));
+
+    WriteOp op;
+    op.type = WriteOpType::kDelete;
+    op.keys = {1};
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    ASSERT_GT(scratch.all_cmds[0][1].capacity(),
+              MetaAsyncRedisBackend::ConsumerScratch::kRetainedRedisKeyCapacity);
+
+    scratch.ResetForPop();
+    ASSERT_EQ(1u, scratch.recycled_cmds.size());
+    ASSERT_EQ(2u, scratch.recycled_cmds[0].size());
+    EXPECT_TRUE(scratch.recycled_cmds[0][1].empty());
+    EXPECT_LE(scratch.recycled_cmds[0][1].capacity(),
+              MetaAsyncRedisBackend::ConsumerScratch::kRetainedRedisKeyCapacity);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchAcquireCommandHasUniformSizeContract) {
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    auto &command = scratch.AcquireCommand(5);
+    EXPECT_EQ(5u, command.size());
+    EXPECT_GE(command.capacity(), 5u);
+    command[0] = "HDEL";
+    command[1] = "key";
+    command[2] = "field-1";
+    command[3] = "field-2";
+    command[4] = "field-3";
+
+    scratch.ResetForPop();
+    EXPECT_TRUE(scratch.recycled_cmds.empty());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchMixedBatchesPreserveCommandsAndBarrierRanges) {

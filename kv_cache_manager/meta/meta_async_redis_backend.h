@@ -104,10 +104,11 @@ private:
 
     struct ConsumerScratch {
         // ResetForPop must run before every queue pop. It clears all logical
-        // batch state and applies these conservative outer-vector caps; inner
-        // QueueItem and CmdArgs payloads are destroyed every round. The command
-        // cap retains the existing 2x reserve only up to 1024-key batches and
-        // releases larger bursts instead of pinning them across q128 consumers.
+        // batch state and applies these conservative outer-vector caps. Compact
+        // commands retain only bounded vector and Redis-key storage; every
+        // field and JSON payload is destroyed. The command cap retains the
+        // existing 2x reserve only up to 1024-key batches and releases larger
+        // bursts instead of pinning them across q128 consumers.
         static constexpr size_t kRetainedItemCapacity = 512;
         static constexpr size_t kRetainedCommandCapacity = 2048;
         static constexpr size_t kRetainedBarrierCapacity = 128;
@@ -116,6 +117,9 @@ private:
         // storage.
         static constexpr size_t kRetainedCommandArgCapacity = 4;
         static constexpr size_t kRetainedRecycledCommandCount = 512;
+        // Covers the fixed prefix, a typical instance id, and an int64 key.
+        // Longer instance ids intentionally fall back to per-command allocation.
+        static constexpr size_t kRetainedRedisKeyCapacity = 128;
 
         ConsumerScratch();
         void ResetForPop() noexcept;

@@ -1,7 +1,9 @@
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -25,6 +27,16 @@ void ResetBoundedVector(std::vector<T> &values, size_t retained_capacity) noexce
     if (values.capacity() > retained_capacity) {
         std::vector<T>().swap(values);
     }
+}
+
+void AssignRedisKey(const std::string &prefix, KeyType key, std::string &out) {
+    static_assert(std::numeric_limits<KeyType>::is_integer && std::numeric_limits<KeyType>::is_signed);
+    // digits10 excludes one possible leading digit and the sign; the final
+    // spare byte keeps the buffer sufficient without relying on a terminator.
+    char key_chars[std::numeric_limits<KeyType>::digits10 + 3];
+    const auto result = std::to_chars(key_chars, key_chars + sizeof(key_chars), key);
+    out.assign(prefix);
+    out.append(key_chars, result.ptr);
 }
 
 } // namespace
@@ -779,7 +791,15 @@ void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
         }
         if (cmd.size() >= 2 && cmd.size() <= kRetainedCommandArgCapacity &&
             cmd.capacity() == kRetainedCommandArgCapacity) {
-            cmd.clear();
+            cmd[0].clear();
+            cmd[1].clear();
+            if (cmd[1].capacity() > kRetainedRedisKeyCapacity) {
+                std::string().swap(cmd[1]);
+            }
+            for (size_t i = 2; i < cmd.size(); ++i) {
+                std::string().swap(cmd[i]);
+            }
+            cmd.resize(2);
             recycled_cmds.emplace_back(std::move(cmd));
         }
     }
@@ -795,10 +815,14 @@ MetaAsyncRedisBackend::CmdArgs &MetaAsyncRedisBackend::ConsumerScratch::AcquireC
         command = std::move(recycled_cmds.back());
         recycled_cmds.pop_back();
     }
+    if (retainable) {
+        command.reserve(kRetainedCommandArgCapacity);
+    } else {
+        command.reserve(arg_count);
+    }
+    command.resize(arg_count);
     all_cmds.emplace_back(std::move(command));
-    auto &active_command = all_cmds.back();
-    active_command.reserve(retainable ? kRetainedCommandArgCapacity : arg_count);
-    return active_command;
+    return all_cmds.back();
 }
 
 void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
@@ -826,10 +850,11 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
         for (size_t i = 0; i < op.keys.size(); ++i) {
             const auto &location = op.single_locations[i];
             auto &command = scratch.AcquireCommand(4);
-            command.emplace_back("HSET");
-            command.emplace_back(cache_key_prefix_ + std::to_string(op.keys[i]));
-            command.emplace_back(PROPERTY_LOCATION_PREFIX + location->id());
-            command.emplace_back(location->ToJsonString());
+            command[0] = "HSET";
+            AssignRedisKey(cache_key_prefix_, op.keys[i], command[1]);
+            command[2].assign(PROPERTY_LOCATION_PREFIX);
+            command[2].append(location->id());
+            command[3] = location->ToJsonString();
         }
         op.single_locations.clear();
         return;
@@ -837,9 +862,10 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
     if (op.type == WriteOpType::kDeleteSingleLocation) {
         for (size_t i = 0; i < op.keys.size(); ++i) {
             auto &command = scratch.AcquireCommand(3);
-            command.emplace_back("HDEL");
-            command.emplace_back(cache_key_prefix_ + std::to_string(op.keys[i]));
-            command.emplace_back(PROPERTY_LOCATION_PREFIX + op.single_location_ids[i]);
+            command[0] = "HDEL";
+            AssignRedisKey(cache_key_prefix_, op.keys[i], command[1]);
+            command[2].assign(PROPERTY_LOCATION_PREFIX);
+            command[2].append(op.single_location_ids[i]);
         }
         op.single_location_ids.clear();
         return;
@@ -847,8 +873,8 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
     if (op.type == WriteOpType::kDelete) {
         for (const KeyType key : op.keys) {
             auto &command = scratch.AcquireCommand(2);
-            command.emplace_back("DEL");
-            command.emplace_back(cache_key_prefix_ + std::to_string(key));
+            command[0] = "DEL";
+            AssignRedisKey(cache_key_prefix_, key, command[1]);
         }
         return;
     }
