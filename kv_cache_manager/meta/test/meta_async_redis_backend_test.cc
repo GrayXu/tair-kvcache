@@ -441,6 +441,39 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpEmptyFieldMaps) {
     ASSERT_EQ("DEL", cmds[0][0]);
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchReusesNormalCapacityAndReleasesOversizedCapacity) {
+    MetaAsyncRedisBackend::ConsumerScratch normal;
+    normal.items.reserve(8);
+    normal.all_cmds.reserve(16);
+    normal.barriers.reserve(4);
+    WriteOp op;
+    op.type = WriteOpType::kDelete;
+    op.keys = {1};
+    normal.items.emplace_back(std::move(op));
+    normal.all_cmds.push_back({"stale"});
+    normal.barriers.push_back({nullptr, 0, 1, 1});
+    const size_t item_capacity = normal.items.capacity();
+    const size_t command_capacity = normal.all_cmds.capacity();
+    const size_t barrier_capacity = normal.barriers.capacity();
+
+    normal.ResetForPop();
+    EXPECT_TRUE(normal.items.empty());
+    EXPECT_TRUE(normal.all_cmds.empty());
+    EXPECT_TRUE(normal.barriers.empty());
+    EXPECT_EQ(item_capacity, normal.items.capacity());
+    EXPECT_EQ(command_capacity, normal.all_cmds.capacity());
+    EXPECT_EQ(barrier_capacity, normal.barriers.capacity());
+
+    MetaAsyncRedisBackend::ConsumerScratch oversized;
+    oversized.items.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedItemCapacity + 1);
+    oversized.all_cmds.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandCapacity + 1);
+    oversized.barriers.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedBarrierCapacity + 1);
+    oversized.ResetForPop();
+    EXPECT_LE(oversized.items.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedItemCapacity);
+    EXPECT_LE(oversized.all_cmds.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandCapacity);
+    EXPECT_LE(oversized.barriers.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedBarrierCapacity);
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwnedSnapshot) {
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64"
                            "&async_wait_us=1000&async_max_size=1000&async_sync_timeout_ms=5000");

@@ -59,6 +59,33 @@ TEST_F(RedisClientTest, TestCommandPipelineSimple) {
     ASSERT_EQ("OK", std::string(replies[1]->str));
 }
 
+TEST_F(RedisClientTest, TestInlineRedisArgvMappingPreservesArgumentBytes) {
+    const std::string binary_value("binary\0value", 12);
+    std::vector<CmdArgs> commands{
+        {"DEL", ""},
+        {"HSET", "key", "field", binary_value},
+        {"HSET", "key", "field", binary_value, "f2", "v2", "", "tail"},
+        {"HSET", "key", "f1", "v1", "f2", "v2", "f3", "v3", binary_value},
+    };
+    ASSERT_EQ(RedisClient::kInlineRedisArgCount, commands[2].size());
+    ASSERT_EQ(RedisClient::kInlineRedisArgCount + 1, commands[3].size());
+
+    for (size_t command_index = 0; command_index < 3; ++command_index) {
+        const auto &command = commands[command_index];
+        std::array<const char *, RedisClient::kInlineRedisArgCount> argv;
+        std::array<size_t, RedisClient::kInlineRedisArgCount> argvlen;
+        const int argc = RedisClient::FillInlineRedisArgv(command, argv, argvlen);
+        EXPECT_EQ(command.size(), static_cast<size_t>(argc));
+        for (size_t i = 0; i < command.size(); ++i) {
+            EXPECT_EQ(command[i].data(), argv[i]);
+            EXPECT_EQ(command[i].size(), argvlen[i]);
+            if (!command[i].empty()) {
+                EXPECT_EQ(command[i], std::string(argv[i], argvlen[i]));
+            }
+        }
+    }
+}
+
 TEST_F(RedisClientTest, TestCommandPipelineError) {
     {
         // connection error always

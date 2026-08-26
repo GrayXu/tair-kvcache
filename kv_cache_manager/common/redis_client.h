@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cassert>
 #include <hiredis.h>
 #include <map>
 #include <memory>
@@ -101,6 +103,19 @@ protected:
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
 
 private:
+    static constexpr size_t kInlineRedisArgCount = 8;
+    template <size_t N>
+    static int FillInlineRedisArgv(const CmdArgs &cmd,
+                                   std::array<const char *, N> &argv,
+                                   std::array<size_t, N> &argvlen) noexcept {
+        assert(cmd.size() <= N);
+        for (size_t i = 0; i < cmd.size(); ++i) {
+            argv[i] = cmd[i].data();
+            argvlen[i] = cmd[i].size();
+        }
+        return static_cast<int>(cmd.size());
+    }
+
     redisContext *context_ = nullptr;
     std::string user_info_;
     std::string host_;

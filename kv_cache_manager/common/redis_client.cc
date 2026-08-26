@@ -176,15 +176,25 @@ bool RedisClient::Reconnect() {
 std::vector<RedisClient::ReplyUPtr> RedisClient::TryExecPipeline(const std::vector<CmdArgs> &cmds) {
     std::vector<ReplyUPtr> replies;
     for (const CmdArgs &cmd : cmds) {
-        std::vector<const char *> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(cmd.size());
-        argvlen.reserve(cmd.size());
-        for (const auto &cmd_arg : cmd) {
-            argv.push_back(cmd_arg.data());
-            argvlen.push_back(cmd_arg.size());
+        int append_result = REDIS_ERR;
+        if (cmd.size() <= kInlineRedisArgCount) {
+            std::array<const char *, kInlineRedisArgCount> argv;
+            std::array<size_t, kInlineRedisArgCount> argvlen;
+            const int argc = FillInlineRedisArgv(cmd, argv, argvlen);
+            append_result = redisAppendCommandArgv(context_, argc, argv.data(), argvlen.data());
+        } else {
+            std::vector<const char *> argv;
+            std::vector<size_t> argvlen;
+            argv.reserve(cmd.size());
+            argvlen.reserve(cmd.size());
+            for (const auto &cmd_arg : cmd) {
+                argv.push_back(cmd_arg.data());
+                argvlen.push_back(cmd_arg.size());
+            }
+            append_result =
+                redisAppendCommandArgv(context_, static_cast<int>(argv.size()), argv.data(), argvlen.data());
         }
-        if (redisAppendCommandArgv(context_, (int)argv.size(), argv.data(), argvlen.data()) != REDIS_OK) {
+        if (append_result != REDIS_OK) {
             KVCM_REDIS_LOG_WARN("redisAppendCommandArgv failed: %s", context_->errstr);
             return replies;
         }

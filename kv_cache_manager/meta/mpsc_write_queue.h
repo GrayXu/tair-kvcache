@@ -82,7 +82,13 @@ public:
 
     void Push(QueueItem item);
     std::vector<QueueItem> PopBatch(int64_t max_batch_size, int64_t &out_taken_keys);
+    // Clears logical contents before filling while retaining caller-owned capacity.
+    void PopBatch(int64_t max_batch_size, int64_t &out_taken_keys, std::vector<QueueItem> &out_items);
     std::vector<QueueItem> PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, int64_t &out_taken_keys);
+    void PopBatchWait(int64_t max_batch_size,
+                      int64_t wait_timeout_us,
+                      int64_t &out_taken_keys,
+                      std::vector<QueueItem> &out_items);
     int64_t GetKeySize() const { return key_size_.load(std::memory_order_relaxed); }
     void NotifyConsumer();
 

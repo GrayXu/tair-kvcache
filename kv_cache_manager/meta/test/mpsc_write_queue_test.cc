@@ -98,6 +98,35 @@ TEST_F(MpscWriteQueueTest, TestRepeatedPopBatchClearsConsumerLeftover) {
     ASSERT_EQ(0, taken_keys_);
 }
 
+TEST_F(MpscWriteQueueTest, TestCallerOwnedPopBatchClearsOutputAndReusesCapacity) {
+    std::vector<QueueItem> items;
+    items.reserve(8);
+    items.emplace_back(MakeWriteOp(WriteOpType::kDelete, {99}));
+    const size_t retained_capacity = items.capacity();
+
+    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1})});
+    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {2})});
+    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {3})});
+
+    queue_->PopBatch(2, taken_keys_, items);
+    ASSERT_EQ(2, taken_keys_);
+    ASSERT_EQ(2u, items.size());
+    EXPECT_EQ(retained_capacity, items.capacity());
+    EXPECT_EQ((KeyTypeVec{1}), std::get<WriteOp>(items[0]).keys);
+    EXPECT_EQ((KeyTypeVec{2}), std::get<WriteOp>(items[1]).keys);
+
+    queue_->PopBatch(2, taken_keys_, items);
+    ASSERT_EQ(1, taken_keys_);
+    ASSERT_EQ(1u, items.size());
+    EXPECT_EQ(retained_capacity, items.capacity());
+    EXPECT_EQ((KeyTypeVec{3}), std::get<WriteOp>(items[0]).keys);
+
+    queue_->PopBatch(2, taken_keys_, items);
+    EXPECT_TRUE(items.empty());
+    EXPECT_EQ(0, taken_keys_);
+    EXPECT_EQ(retained_capacity, items.capacity());
+}
+
 TEST_F(MpscWriteQueueTest, TestPopBatchWaitTimeout) {
     auto start = std::chrono::steady_clock::now();
     auto items = queue_->PopBatchWait(10, 50000, taken_keys_); // 50ms timeout

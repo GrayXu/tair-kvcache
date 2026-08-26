@@ -35,6 +35,14 @@ void MpscWriteQueue::Push(QueueItem item) {
 
 std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t &out_taken_keys) {
     std::vector<QueueItem> result;
+    PopBatch(max_batch_size, out_taken_keys, result);
+    return result;
+}
+
+void MpscWriteQueue::PopBatch(int64_t max_batch_size,
+                              int64_t &out_taken_keys,
+                              std::vector<QueueItem> &out_items) {
+    out_items.clear();
     out_taken_keys = 0;
 
     // 1. Serve from consumer-local leftover chain (FIFO order preserved)
@@ -42,7 +50,7 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
     while (consumer_head_ && out_taken_keys < max_batch_size) {
         out_taken_keys += consumer_head_->key_count;
         leftover_consumed += consumer_head_->key_count;
-        result.emplace_back(std::move(consumer_head_->item));
+        out_items.emplace_back(std::move(consumer_head_->item));
         Node *to_delete = consumer_head_;
         consumer_head_ = consumer_head_->next;
         delete to_delete;
@@ -52,13 +60,13 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
         capacity_cv_.notify_all();
     }
     if (out_taken_keys >= max_batch_size) {
-        return result;
+        return;
     }
 
     // 2. Drain from lock-free list
     Node *chain = head_.exchange(nullptr, std::memory_order_acq_rel);
     if (!chain) {
-        return result;
+        return;
     }
 
     // Reverse the chain to restore FIFO order (MPSC push builds LIFO)
@@ -77,7 +85,7 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
     while (node && out_taken_keys < max_batch_size) {
         out_taken_keys += node->key_count;
         chain_consumed += node->key_count;
-        result.emplace_back(std::move(node->item));
+        out_items.emplace_back(std::move(node->item));
         Node *to_delete = node;
         node = node->next;
         delete to_delete;
@@ -90,15 +98,22 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
         key_size_.fetch_sub(chain_consumed, std::memory_order_release);
         capacity_cv_.notify_all();
     }
-
-    return result;
 }
 
 std::vector<QueueItem>
 MpscWriteQueue::PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, int64_t &out_taken_keys) {
-    std::vector<QueueItem> result = PopBatch(max_batch_size, out_taken_keys);
-    if (!result.empty()) {
-        return result;
+    std::vector<QueueItem> result;
+    PopBatchWait(max_batch_size, wait_timeout_us, out_taken_keys, result);
+    return result;
+}
+
+void MpscWriteQueue::PopBatchWait(int64_t max_batch_size,
+                                  int64_t wait_timeout_us,
+                                  int64_t &out_taken_keys,
+                                  std::vector<QueueItem> &out_items) {
+    PopBatch(max_batch_size, out_taken_keys, out_items);
+    if (!out_items.empty()) {
+        return;
     }
 
     // Wait for data to arrive
@@ -109,7 +124,7 @@ MpscWriteQueue::PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, in
         });
     }
 
-    return PopBatch(max_batch_size, out_taken_keys);
+    PopBatch(max_batch_size, out_taken_keys, out_items);
 }
 
 void MpscWriteQueue::NotifyConsumer() { wait_cv_.notify_one(); }

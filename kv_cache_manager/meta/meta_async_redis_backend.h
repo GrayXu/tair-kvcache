@@ -93,15 +93,40 @@ public:
     AsyncWriteStats GetAsyncWriteStats() noexcept override;
 
 private:
+    using CmdArgs = std::vector<std::string>;
+
+    struct BarrierRecord {
+        std::shared_ptr<BarrierContext> ctx;
+        size_t cmd_begin;
+        size_t cmd_end;
+        int64_t key_count;
+    };
+
+    struct ConsumerScratch {
+        // ResetForPop must run before every queue pop. It clears all logical
+        // batch state and applies these conservative outer-vector caps; inner
+        // QueueItem and CmdArgs payloads are destroyed every round. The command
+        // cap retains the existing 2x reserve only up to 1024-key batches and
+        // releases larger bursts instead of pinning them across q128 consumers.
+        static constexpr size_t kRetainedItemCapacity = 512;
+        static constexpr size_t kRetainedCommandCapacity = 2048;
+        static constexpr size_t kRetainedBarrierCapacity = 128;
+
+        void ResetForPop() noexcept;
+
+        std::vector<QueueItem> items;
+        std::vector<CmdArgs> all_cmds;
+        std::vector<BarrierRecord> barriers;
+    };
+
     std::vector<ErrorCode> EnqueueWriteOp(RequestContext *request_context, WriteOp op);
     bool WaitForQueueCapacity(int queue_id, int64_t incoming_key_count);
     void ConsumerLoop(int queue_id);
     void CleanupResources() noexcept;
-    void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
-    void DrainQueue(int queue_id);
+    void BatchFlush(int queue_id, ConsumerScratch &scratch, int64_t total_keys);
+    void DrainQueue(int queue_id, ConsumerScratch &scratch);
     int GetQueueIndexForKey(KeyType key) const noexcept;
 
-    using CmdArgs = std::vector<std::string>;
     void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
 
     // virtual for test

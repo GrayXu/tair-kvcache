@@ -17,6 +17,18 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+template <typename T>
+void ResetBoundedVector(std::vector<T> &values, size_t retained_capacity) noexcept {
+    values.clear();
+    if (values.capacity() > retained_capacity) {
+        std::vector<T>().swap(values);
+    }
+}
+
+} // namespace
+
 MetaAsyncRedisBackend::~MetaAsyncRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); }
 
 std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC_REDIS_BACKEND_TYPE_STR; }
@@ -735,19 +747,28 @@ MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() 
 
 // ==================== Consumer Thread ====================
 
+void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
+    ResetBoundedVector(items, kRetainedItemCapacity);
+    ResetBoundedVector(all_cmds, kRetainedCommandCapacity);
+    ResetBoundedVector(barriers, kRetainedBarrierCapacity);
+}
+
 void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
     KVCM_LOG_INFO("async redis consumer[%d] started, instance[%s]", queue_id, instance_id_.c_str());
 
+    ConsumerScratch scratch;
     while (is_running_.load(std::memory_order_acquire)) {
+        scratch.ResetForPop();
         int64_t taken_keys = 0;
-        auto items = queues_[queue_id]->PopBatchWait(max_batch_size_, batch_wait_timeout_us_, taken_keys);
-        if (items.empty()) {
+        queues_[queue_id]->PopBatchWait(
+            max_batch_size_, batch_wait_timeout_us_, taken_keys, scratch.items);
+        if (scratch.items.empty()) {
             continue;
         }
-        BatchFlush(queue_id, items, taken_keys);
+        BatchFlush(queue_id, scratch, taken_keys);
     }
 
-    DrainQueue(queue_id);
+    DrainQueue(queue_id, scratch);
     KVCM_LOG_INFO("async redis consumer[%d] stopped, instance[%s]", queue_id, instance_id_.c_str());
 }
 
@@ -797,23 +818,17 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
     op.field_maps.clear();
 }
 
-void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys) {
+void MetaAsyncRedisBackend::BatchFlush(int queue_id, ConsumerScratch &scratch, int64_t total_keys) {
     const int64_t flush_begin_us = TimestampUtil::GetSteadyTimeUs();
     RedisClient *client = consumer_clients_[queue_id].get();
 
-    std::vector<CmdArgs> all_cmds;
+    auto &all_cmds = scratch.all_cmds;
     all_cmds.reserve(static_cast<size_t>(total_keys) * 2);
-    struct BarrierRecord {
-        std::shared_ptr<BarrierContext> ctx;
-        size_t cmd_begin;
-        size_t cmd_end;
-        int64_t key_count;
-    };
-    std::vector<BarrierRecord> barriers;
+    auto &barriers = scratch.barriers;
     size_t segment_cmd_begin = 0;
     int64_t segment_key_count = 0;
 
-    for (auto &item : items) {
+    for (auto &item : scratch.items) {
         if (std::holds_alternative<WriteOp>(item)) {
             segment_key_count += static_cast<int64_t>(std::get<WriteOp>(item).keys.size());
             CompileWriteOp(std::get<WriteOp>(item), all_cmds);
@@ -895,28 +910,30 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
     stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us, std::memory_order_relaxed);
 }
 
-void MetaAsyncRedisBackend::DrainQueue(int queue_id) {
+void MetaAsyncRedisBackend::DrainQueue(int queue_id, ConsumerScratch &scratch) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(drain_timeout_ms_);
 
     while (std::chrono::steady_clock::now() < deadline) {
+        scratch.ResetForPop();
         int64_t taken_keys = 0;
-        auto items = queues_[queue_id]->PopBatch(max_batch_size_, taken_keys);
-        if (items.empty()) {
+        queues_[queue_id]->PopBatch(max_batch_size_, taken_keys, scratch.items);
+        if (scratch.items.empty()) {
             break;
         }
-        BatchFlush(queue_id, items, taken_keys);
+        BatchFlush(queue_id, scratch, taken_keys);
     }
 
     size_t dropped_write_op_count = 0;
     size_t dropped_key_count = 0;
     size_t dropped_barrier_count = 0;
     while (true) {
+        scratch.ResetForPop();
         int64_t remaining_keys = 0;
-        auto remaining = queues_[queue_id]->PopBatch(queue_max_size_, remaining_keys);
-        if (remaining.empty()) {
+        queues_[queue_id]->PopBatch(queue_max_size_, remaining_keys, scratch.items);
+        if (scratch.items.empty()) {
             break;
         }
-        for (auto &item : remaining) {
+        for (auto &item : scratch.items) {
             if (std::holds_alternative<WriteOp>(item)) {
                 ++dropped_write_op_count;
                 dropped_key_count += std::get<WriteOp>(item).keys.size();
