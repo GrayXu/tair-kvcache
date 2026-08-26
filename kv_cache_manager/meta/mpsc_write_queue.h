@@ -16,6 +16,7 @@ enum class WriteOpType {
     kPut,
     kUpsert,
     kUpsertSingleLocation,
+    kDeleteSingleLocation,
     kDelete,
     kDeleteLocations,
 };
@@ -26,6 +27,7 @@ struct WriteOp {
     FieldMapVec field_maps;
     CacheLocationMapVector locations;
     CacheLocationVector single_locations;
+    LocationIdVector single_location_ids;
     std::vector<std::vector<std::string>> field_names_vec;
 
     WriteOp() = default;

@@ -111,8 +111,9 @@ private:
         static constexpr size_t kRetainedItemCapacity = 512;
         static constexpr size_t kRetainedCommandCapacity = 2048;
         static constexpr size_t kRetainedBarrierCapacity = 128;
-        // q128 retains at most 512 four-string vector buffers per consumer;
-        // ResetForPop destroys every string payload before recycling storage.
+        // q128 retains at most 512 three/four-string vector buffers per
+        // consumer; ResetForPop destroys every string payload before recycling
+        // storage.
         static constexpr size_t kRetainedCommandArgCapacity = 4;
         static constexpr size_t kRetainedRecycledCommandCount = 512;
 

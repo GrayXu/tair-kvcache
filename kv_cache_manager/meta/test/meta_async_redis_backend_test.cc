@@ -210,6 +210,37 @@ TEST_F(MetaAsyncRedisBackendTest, TestUpsertSingleLocationsValidatesAlignedInput
     EXPECT_THAT(backend_->UpsertSingleLocations(nullptr, {1}, {&second_id}, {first}), ElementsAre(EC_BADARGS));
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestDeleteLocationsSelectsCompactOrGenericOwnedPayload) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64"
+                           "&async_wait_us=1000&async_max_size=1000&async_enqueue_timeout_ms=0");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    backend_->queues_.push_back(std::make_unique<MpscWriteQueue>());
+
+    EXPECT_THAT(backend_->DeleteLocations(nullptr, {1}, {}), ElementsAre(EC_BADARGS));
+
+    LocationIdsPerKey singleton_ids = {{"single"}};
+    EXPECT_THAT(backend_->DeleteLocations(nullptr, {10}, singleton_ids), ElementsAre(EC_OK));
+    singleton_ids[0][0] = "mutated";
+
+    int64_t taken_keys = 0;
+    auto items = backend_->queues_[0]->PopBatch(64, taken_keys);
+    ASSERT_EQ(1u, items.size());
+    auto &compact_op = std::get<WriteOp>(items[0]);
+    EXPECT_EQ(WriteOpType::kDeleteSingleLocation, compact_op.type);
+    EXPECT_EQ((KeyTypeVec{10}), compact_op.keys);
+    EXPECT_EQ((LocationIdVector{"single"}), compact_op.single_location_ids);
+    EXPECT_TRUE(compact_op.field_names_vec.empty());
+
+    LocationIdsPerKey multi_ids = {{"first", "second"}};
+    EXPECT_THAT(backend_->DeleteLocations(nullptr, {11}, multi_ids), ElementsAre(EC_OK));
+    items = backend_->queues_[0]->PopBatch(64, taken_keys);
+    ASSERT_EQ(1u, items.size());
+    auto &generic_op = std::get<WriteOp>(items[0]);
+    EXPECT_EQ(WriteOpType::kDeleteLocations, generic_op.type);
+    EXPECT_TRUE(generic_op.single_location_ids.empty());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"L#first", "L#second"}}), generic_op.field_names_vec);
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestDelete) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
@@ -395,6 +426,23 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsertSingleLocation) {
     EXPECT_TRUE(op.single_locations.empty());
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteSingleLocation) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    WriteOp op;
+    op.type = WriteOpType::kDeleteSingleLocation;
+    op.keys = {32, 33};
+    op.single_location_ids = {"first", "second"};
+
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+
+    EXPECT_THAT(scratch.all_cmds,
+                ElementsAre(ElementsAre("HDEL", "kvcache:instance_test_instance:cache_32", "L#first"),
+                            ElementsAre("HDEL", "kvcache:instance_test_instance:cache_33", "L#second")));
+    EXPECT_TRUE(op.single_location_ids.empty());
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
@@ -517,12 +565,53 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchRecyclesCompactCommandStora
     EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelAndHsetStorage) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    WriteOp delete_op;
+    delete_op.type = WriteOpType::kDeleteSingleLocation;
+    delete_op.keys = {83};
+    delete_op.single_location_ids = {"deleted"};
+    backend_->CompileWriteOp(delete_op, scratch);
+    ASSERT_EQ(1u, scratch.all_cmds.size());
+    ASSERT_EQ(3u, scratch.all_cmds[0].size());
+    ASSERT_GE(scratch.all_cmds[0].capacity(),
+              MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
+    auto *const first_storage = scratch.all_cmds[0].data();
+
+    scratch.ResetForPop();
+    ASSERT_EQ(1u, scratch.recycled_cmds.size());
+    EXPECT_TRUE(scratch.recycled_cmds[0].empty());
+    EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
+
+    std::atomic<int> serialize_count{0};
+    auto location = std::make_shared<TrackingCacheLocation>(serialize_count, "replacement-json");
+    location->set_id("replacement");
+    WriteOp upsert_op;
+    upsert_op.type = WriteOpType::kUpsertSingleLocation;
+    upsert_op.keys = {84};
+    upsert_op.single_locations = {std::move(location)};
+    backend_->CompileWriteOp(upsert_op, scratch);
+
+    ASSERT_EQ(1u, scratch.all_cmds.size());
+    EXPECT_TRUE(scratch.recycled_cmds.empty());
+    EXPECT_EQ(first_storage, scratch.all_cmds[0].data());
+    EXPECT_THAT(scratch.all_cmds[0],
+                ElementsAre("HSET", "kvcache:instance_test_instance:cache_84", "L#replacement", "replacement-json"));
+    EXPECT_EQ(1, serialize_count.load(std::memory_order_relaxed));
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchBoundsRecyclerAndRejectsOversizedCommands) {
     MetaAsyncRedisBackend::ConsumerScratch bounded;
     for (size_t i = 0; i < MetaAsyncRedisBackend::ConsumerScratch::kRetainedRecycledCommandCount + 16; ++i) {
         CmdArgs command;
         command.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
-        command.assign({"HSET", "key", "field", "payload"});
+        if (i % 2 == 0) {
+            command.assign({"HSET", "key", "field", "payload"});
+        } else {
+            command.assign({"HDEL", "key", "field"});
+        }
         bounded.all_cmds.emplace_back(std::move(command));
     }
     bounded.ResetForPop();
@@ -580,17 +669,26 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchMixedBatchesPreserveCommand
         op.keys = {key};
         return op;
     };
+    auto make_delete_location_op = [](KeyType key, std::string id) {
+        WriteOp op;
+        op.type = WriteOpType::kDeleteSingleLocation;
+        op.keys = {key};
+        op.single_location_ids = {std::move(id)};
+        return op;
+    };
 
     MetaAsyncRedisBackend::ConsumerScratch scratch;
     auto first_barrier = std::make_shared<BarrierContext>();
     first_barrier->remain.store(1, std::memory_order_release);
     scratch.items.emplace_back(make_compact_op(91, "first", "first-json"));
     scratch.items.emplace_back(SyncBarrierItem{first_barrier});
+    scratch.items.emplace_back(make_delete_location_op(95, "deleted-first"));
     scratch.items.emplace_back(make_delete_op(92));
-    backend_->BatchFlush(0, scratch, 2);
+    backend_->BatchFlush(0, scratch, 3);
     ASSERT_EQ(1u, observed_batches.size());
     EXPECT_THAT(observed_batches[0],
                 ElementsAre(ElementsAre("HSET", "kvcache:instance_test_instance:cache_91", "L#first", "first-json"),
+                            ElementsAre("HDEL", "kvcache:instance_test_instance:cache_95", "L#deleted-first"),
                             ElementsAre("DEL", "kvcache:instance_test_instance:cache_92")));
     ASSERT_EQ(1u, scratch.barriers.size());
     EXPECT_EQ(0u, scratch.barriers[0].cmd_begin);
@@ -603,11 +701,13 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchMixedBatchesPreserveCommand
     second_barrier->remain.store(1, std::memory_order_release);
     scratch.items.emplace_back(make_delete_op(93));
     scratch.items.emplace_back(SyncBarrierItem{second_barrier});
+    scratch.items.emplace_back(make_delete_location_op(96, "deleted-second"));
     scratch.items.emplace_back(make_compact_op(94, "second", "second-json"));
-    backend_->BatchFlush(0, scratch, 2);
+    backend_->BatchFlush(0, scratch, 3);
     ASSERT_EQ(2u, observed_batches.size());
     EXPECT_THAT(observed_batches[1],
                 ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_93"),
+                            ElementsAre("HDEL", "kvcache:instance_test_instance:cache_96", "L#deleted-second"),
                             ElementsAre(
                                 "HSET", "kvcache:instance_test_instance:cache_94", "L#second", "second-json")));
     ASSERT_EQ(1u, scratch.barriers.size());
@@ -800,6 +900,49 @@ TEST_F(MetaAsyncRedisBackendTest, TestUpsertSingleLocationsPreservesMultiQueueAl
             ASSERT_TRUE(op.single_locations[i]);
             EXPECT_EQ(expected_ids[queue_id][i], op.single_locations[i]->id());
         }
+    }
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestDeleteSingleLocationsPreservesMultiQueueAlignmentAndOwnership) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=3&async_max_batch=64"
+                           "&async_wait_us=1000&async_max_size=1000&async_enqueue_timeout_ms=0");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    backend_->queues_.resize(backend_->queue_count_);
+    for (auto &queue : backend_->queues_) {
+        queue = std::make_unique<MpscWriteQueue>();
+    }
+
+    const KeyTypeVec keys = {21, 22, 23, 24, 25, 26, 27, 28};
+    LocationIdsPerKey location_ids;
+    location_ids.reserve(keys.size());
+    for (const KeyType key : keys) {
+        location_ids.push_back({"location-" + std::to_string(key)});
+    }
+
+    std::vector<KeyTypeVec> expected_keys(backend_->queue_count_);
+    std::vector<LocationIdVector> expected_ids(backend_->queue_count_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const int queue_id = backend_->GetQueueIndexForKey(keys[i]);
+        expected_keys[queue_id].push_back(keys[i]);
+        expected_ids[queue_id].push_back(location_ids[i][0]);
+    }
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), backend_->DeleteLocations(nullptr, keys, location_ids));
+    location_ids.clear();
+
+    for (int queue_id = 0; queue_id < backend_->queue_count_; ++queue_id) {
+        int64_t taken_keys = 0;
+        auto items = backend_->queues_[queue_id]->PopBatch(64, taken_keys);
+        if (expected_keys[queue_id].empty()) {
+            EXPECT_TRUE(items.empty());
+            continue;
+        }
+        ASSERT_EQ(1u, items.size());
+        auto &op = std::get<WriteOp>(items.front());
+        EXPECT_EQ(WriteOpType::kDeleteSingleLocation, op.type);
+        EXPECT_EQ(expected_keys[queue_id], op.keys);
+        EXPECT_EQ(expected_ids[queue_id], op.single_location_ids);
+        EXPECT_TRUE(op.field_names_vec.empty());
     }
 }
 

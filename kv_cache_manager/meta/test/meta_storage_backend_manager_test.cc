@@ -687,6 +687,75 @@ TEST_F(MetaStorageBackendManagerTest, TestCachedSingleLocationRmwCommitsOnlyAdmi
     EXPECT_EQ(EC_OK, mgr.cache_backend_->Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestCachedSingleLocationDeletePreservesAdmissionAndReclaimSemantics) {
+    MetaStorageBackendManager mgr;
+    auto persistent = MakeQueuedAsyncBackend("cached_delete_partial", /*queue_count=*/2, /*queue_max_size=*/2);
+    auto *persistent_raw = persistent.get();
+    auto cache = MakeOpenLocalBackend("cached_delete_partial");
+    auto *cache_raw = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    KeyType rejected_key = -1;
+    KeyType accepted_key_1 = -1;
+    KeyType accepted_key_2 = -1;
+    for (KeyType key = 1; key < 100 && (rejected_key < 0 || accepted_key_1 < 0 || accepted_key_2 < 0); ++key) {
+        if (persistent_raw->GetQueueIndexForKey(key) == 0) {
+            if (rejected_key < 0) {
+                rejected_key = key;
+            }
+        } else if (accepted_key_1 < 0) {
+            accepted_key_1 = key;
+        } else if (accepted_key_2 < 0) {
+            accepted_key_2 = key;
+        }
+    }
+    ASSERT_GE(rejected_key, 0);
+    ASSERT_GE(accepted_key_1, 0);
+    ASSERT_GE(accepted_key_2, 0);
+
+    WriteOp filler;
+    filler.type = WriteOpType::kDelete;
+    filler.keys = {-1, -2};
+    persistent_raw->queues_[0]->Push(QueueItem{std::move(filler)});
+
+    const KeyVector keys = {accepted_key_1, rejected_key, accepted_key_2};
+    const std::string target_id = "target";
+    CacheLocationMapVector seed_locations(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        seed_locations[i].emplace(target_id, MakeLocation(target_id, "old-" + std::to_string(i)));
+    }
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              cache_raw->Put(nullptr, keys, seed_locations, PropertyMapVector(keys.size())));
+
+    int32_t reclaimed = -1;
+    const LocationIdsPerKey location_ids(keys.size(), LocationIdVector{target_id});
+    const auto delete_results = mgr.Delete(request_context_.get(), keys, location_ids, reclaimed);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT, EC_OK}), delete_results);
+    // The admitted HDEL batch fills queue 1. The following whole-key DEL
+    // reclamation cannot be admitted, so existing semantics leave empty local
+    // entries and do not decrement key count through this call.
+    EXPECT_EQ(0, reclaimed);
+
+    CacheLocationMapVector stored_locations;
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              cache_raw->GetLocations(nullptr, keys, stored_locations));
+    EXPECT_TRUE(stored_locations[0].empty());
+    EXPECT_EQ(1u, stored_locations[1].count(target_id));
+    EXPECT_TRUE(stored_locations[2].empty());
+
+    int64_t taken_keys = 0;
+    auto queued_items = persistent_raw->queues_[1]->PopBatch(64, taken_keys);
+    ASSERT_EQ(1u, queued_items.size());
+    const auto &queued_delete = std::get<WriteOp>(queued_items[0]);
+    EXPECT_EQ(WriteOpType::kDeleteSingleLocation, queued_delete.type);
+    EXPECT_EQ((KeyVector{accepted_key_1, accepted_key_2}), queued_delete.keys);
+    EXPECT_EQ((LocationIdVector{target_id, target_id}), queued_delete.single_location_ids);
+
+    EXPECT_EQ(EC_OK, mgr.cache_backend_->Close());
+}
+
 TEST_F(MetaStorageBackendManagerTest, TestPureLocalHashSeedIsNotExposedForCachedOrNonLocalBackends) {
     MetaStorageBackendManager mgr;
     uint32_t hash_seed = 0;

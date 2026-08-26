@@ -263,6 +263,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
         if (!op.single_locations.empty()) {
             sub_op.single_locations.reserve(indices.size());
         }
+        if (!op.single_location_ids.empty()) {
+            sub_op.single_location_ids.reserve(indices.size());
+        }
         if (!op.field_names_vec.empty()) {
             sub_op.field_names_vec.reserve(indices.size());
         }
@@ -274,6 +277,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             }
             if (!op.single_locations.empty()) {
                 sub_op.single_locations.push_back(std::move(op.single_locations[idx]));
+            }
+            if (!op.single_location_ids.empty()) {
+                sub_op.single_location_ids.push_back(std::move(op.single_location_ids[idx]));
             }
             if (!op.field_names_vec.empty()) {
                 sub_op.field_names_vec.push_back(std::move(op.field_names_vec[idx]));
@@ -357,6 +363,23 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_con
 std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext *request_context,
                                                               const KeyTypeVec &keys,
                                                               const LocationIdsPerKey &location_ids) noexcept {
+    if (keys.size() != location_ids.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+
+    WriteOp op;
+    op.keys = keys;
+    const bool use_single_location_path =
+        std::all_of(location_ids.begin(), location_ids.end(), [](const auto &ids) { return ids.size() == 1; });
+    if (use_single_location_path) {
+        op.type = WriteOpType::kDeleteSingleLocation;
+        op.single_location_ids.reserve(location_ids.size());
+        for (const auto &ids : location_ids) {
+            op.single_location_ids.push_back(ids[0]);
+        }
+        return EnqueueWriteOp(request_context, std::move(op));
+    }
+
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
@@ -365,9 +388,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext *re
         }
     }
 
-    WriteOp op;
     op.type = WriteOpType::kDeleteLocations;
-    op.keys = keys;
     op.field_names_vec = std::move(field_names_vec);
     return EnqueueWriteOp(request_context, std::move(op));
 }
@@ -756,7 +777,7 @@ void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
         if (recycled_cmds.size() >= kRetainedRecycledCommandCount) {
             break;
         }
-        if (cmd.size() == kRetainedCommandArgCapacity && cmd.capacity() == kRetainedCommandArgCapacity) {
+        if ((cmd.size() == 3 || cmd.size() == 4) && cmd.capacity() == kRetainedCommandArgCapacity) {
             cmd.clear();
             recycled_cmds.emplace_back(std::move(cmd));
         }
@@ -768,13 +789,14 @@ void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
 
 MetaAsyncRedisBackend::CmdArgs &MetaAsyncRedisBackend::ConsumerScratch::AcquireCommand(size_t arg_count) {
     CmdArgs command;
-    if (arg_count <= kRetainedCommandArgCapacity && !recycled_cmds.empty()) {
+    const bool retainable = arg_count == 3 || arg_count == 4;
+    if (retainable && !recycled_cmds.empty()) {
         command = std::move(recycled_cmds.back());
         recycled_cmds.pop_back();
     }
     all_cmds.emplace_back(std::move(command));
     auto &active_command = all_cmds.back();
-    active_command.reserve(arg_count);
+    active_command.reserve(retainable ? kRetainedCommandArgCapacity : arg_count);
     return active_command;
 }
 
@@ -811,6 +833,16 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
         op.single_locations.clear();
         return;
     }
+    if (op.type == WriteOpType::kDeleteSingleLocation) {
+        for (size_t i = 0; i < op.keys.size(); ++i) {
+            auto &command = scratch.AcquireCommand(3);
+            command.emplace_back("HDEL");
+            command.emplace_back(cache_key_prefix_ + std::to_string(op.keys[i]));
+            command.emplace_back(PROPERTY_LOCATION_PREFIX + op.single_location_ids[i]);
+        }
+        op.single_location_ids.clear();
+        return;
+    }
 
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, op.keys);
 
@@ -830,6 +862,9 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
     case WriteOpType::kUpsertSingleLocation:
         // Handled by the direct four-argument HSET path above.
         break;
+    case WriteOpType::kDeleteSingleLocation:
+        // Handled by the direct three-argument HDEL path above.
+        break;
     case WriteOpType::kDelete:
         RedisClient::BuildDeleteCmds(full_keys, cmds);
         break;
@@ -839,6 +874,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
     }
     op.locations.clear();
     op.single_locations.clear();
+    op.single_location_ids.clear();
     op.field_maps.clear();
 }
 
