@@ -454,10 +454,12 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
     backend_->CompileWriteOp(op, scratch);
     const auto &cmds = scratch.all_cmds;
 
-    ASSERT_EQ(3, cmds.size());
-    for (auto &cmd : cmds) {
-        ASSERT_EQ("DEL", cmd[0]);
-        ASSERT_EQ(2, cmd.size());
+    EXPECT_THAT(cmds,
+                ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_40"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_50"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_60")));
+    for (const auto &cmd : cmds) {
+        EXPECT_GE(cmd.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
     }
 }
 
@@ -565,7 +567,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchRecyclesCompactCommandStora
     EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
 }
 
-TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelAndHsetStorage) {
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelDelAndHsetStorage) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
     MetaAsyncRedisBackend::ConsumerScratch scratch;
@@ -585,12 +587,25 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelAndHsetSto
     EXPECT_TRUE(scratch.recycled_cmds[0].empty());
     EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
 
+    WriteOp whole_delete_op;
+    whole_delete_op.type = WriteOpType::kDelete;
+    whole_delete_op.keys = {84};
+    backend_->CompileWriteOp(whole_delete_op, scratch);
+    ASSERT_EQ(1u, scratch.all_cmds.size());
+    EXPECT_TRUE(scratch.recycled_cmds.empty());
+    EXPECT_EQ(first_storage, scratch.all_cmds[0].data());
+    EXPECT_THAT(scratch.all_cmds[0], ElementsAre("DEL", "kvcache:instance_test_instance:cache_84"));
+
+    scratch.ResetForPop();
+    ASSERT_EQ(1u, scratch.recycled_cmds.size());
+    EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
+
     std::atomic<int> serialize_count{0};
     auto location = std::make_shared<TrackingCacheLocation>(serialize_count, "replacement-json");
     location->set_id("replacement");
     WriteOp upsert_op;
     upsert_op.type = WriteOpType::kUpsertSingleLocation;
-    upsert_op.keys = {84};
+    upsert_op.keys = {85};
     upsert_op.single_locations = {std::move(location)};
     backend_->CompileWriteOp(upsert_op, scratch);
 
@@ -598,7 +613,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchSharesCompactHdelAndHsetSto
     EXPECT_TRUE(scratch.recycled_cmds.empty());
     EXPECT_EQ(first_storage, scratch.all_cmds[0].data());
     EXPECT_THAT(scratch.all_cmds[0],
-                ElementsAre("HSET", "kvcache:instance_test_instance:cache_84", "L#replacement", "replacement-json"));
+                ElementsAre("HSET", "kvcache:instance_test_instance:cache_85", "L#replacement", "replacement-json"));
     EXPECT_EQ(1, serialize_count.load(std::memory_order_relaxed));
 }
 
@@ -607,10 +622,12 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchBoundsRecyclerAndRejectsOve
     for (size_t i = 0; i < MetaAsyncRedisBackend::ConsumerScratch::kRetainedRecycledCommandCount + 16; ++i) {
         CmdArgs command;
         command.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
-        if (i % 2 == 0) {
+        if (i % 3 == 0) {
             command.assign({"HSET", "key", "field", "payload"});
-        } else {
+        } else if (i % 3 == 1) {
             command.assign({"HDEL", "key", "field"});
+        } else {
+            command.assign({"DEL", "key"});
         }
         bounded.all_cmds.emplace_back(std::move(command));
     }

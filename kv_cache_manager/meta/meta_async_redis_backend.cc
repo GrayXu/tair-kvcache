@@ -777,7 +777,8 @@ void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
         if (recycled_cmds.size() >= kRetainedRecycledCommandCount) {
             break;
         }
-        if ((cmd.size() == 3 || cmd.size() == 4) && cmd.capacity() == kRetainedCommandArgCapacity) {
+        if (cmd.size() >= 2 && cmd.size() <= kRetainedCommandArgCapacity &&
+            cmd.capacity() == kRetainedCommandArgCapacity) {
             cmd.clear();
             recycled_cmds.emplace_back(std::move(cmd));
         }
@@ -789,7 +790,7 @@ void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
 
 MetaAsyncRedisBackend::CmdArgs &MetaAsyncRedisBackend::ConsumerScratch::AcquireCommand(size_t arg_count) {
     CmdArgs command;
-    const bool retainable = arg_count == 3 || arg_count == 4;
+    const bool retainable = arg_count >= 2 && arg_count <= kRetainedCommandArgCapacity;
     if (retainable && !recycled_cmds.empty()) {
         command = std::move(recycled_cmds.back());
         recycled_cmds.pop_back();
@@ -843,6 +844,14 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
         op.single_location_ids.clear();
         return;
     }
+    if (op.type == WriteOpType::kDelete) {
+        for (const KeyType key : op.keys) {
+            auto &command = scratch.AcquireCommand(2);
+            command.emplace_back("DEL");
+            command.emplace_back(cache_key_prefix_ + std::to_string(key));
+        }
+        return;
+    }
 
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, op.keys);
 
@@ -866,7 +875,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch
         // Handled by the direct three-argument HDEL path above.
         break;
     case WriteOpType::kDelete:
-        RedisClient::BuildDeleteCmds(full_keys, cmds);
+        // Handled by the direct two-argument DEL path above.
         break;
     case WriteOpType::kDeleteLocations:
         RedisClient::BuildHashDeleteCmds(full_keys, op.field_names_vec, cmds);
