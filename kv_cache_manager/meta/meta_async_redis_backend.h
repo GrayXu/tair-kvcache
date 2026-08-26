@@ -111,12 +111,19 @@ private:
         static constexpr size_t kRetainedItemCapacity = 512;
         static constexpr size_t kRetainedCommandCapacity = 2048;
         static constexpr size_t kRetainedBarrierCapacity = 128;
+        // q128 retains at most 512 four-string vector buffers per consumer;
+        // ResetForPop destroys every string payload before recycling storage.
+        static constexpr size_t kRetainedCommandArgCapacity = 4;
+        static constexpr size_t kRetainedRecycledCommandCount = 512;
 
+        ConsumerScratch();
         void ResetForPop() noexcept;
+        CmdArgs &AcquireCommand(size_t arg_count);
 
         std::vector<QueueItem> items;
         std::vector<CmdArgs> all_cmds;
         std::vector<BarrierRecord> barriers;
+        std::vector<CmdArgs> recycled_cmds;
     };
 
     std::vector<ErrorCode> EnqueueWriteOp(RequestContext *request_context, WriteOp op);
@@ -127,7 +134,7 @@ private:
     void DrainQueue(int queue_id, ConsumerScratch &scratch);
     int GetQueueIndexForKey(KeyType key) const noexcept;
 
-    void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
+    void CompileWriteOp(WriteOp &op, ConsumerScratch &scratch);
 
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;

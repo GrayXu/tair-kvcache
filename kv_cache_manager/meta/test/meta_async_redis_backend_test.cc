@@ -318,8 +318,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpPut) {
                     {{"collision",
                       std::make_shared<TrackingCacheLocation>(collision_serialize_count, "must-not-serialize")}}};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     EXPECT_THAT(cmds,
                 ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_1"),
@@ -351,8 +352,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsert) {
     op.locations = {{{"first", std::make_shared<TrackingCacheLocation>(serialize_count, "first-location-json")},
                      {"second", std::make_shared<TrackingCacheLocation>(serialize_count, "second-location-json")}}};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     EXPECT_THAT(cmds,
                 ElementsAre(ElementsAre("HSET",
@@ -381,8 +383,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsertSingleLocation) {
     op.keys = {30, 31};
     op.single_locations = {first, second};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     EXPECT_THAT(cmds,
                 ElementsAre(ElementsAre("HSET", "kvcache:instance_test_instance:cache_30", "L#first", "first-json"),
@@ -399,8 +402,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
     op.type = WriteOpType::kDelete;
     op.keys = {40, 50, 60};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     ASSERT_EQ(3, cmds.size());
     for (auto &cmd : cmds) {
@@ -417,8 +421,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteLocations) {
     op.keys = {70};
     op.field_names_vec = {{"loc_1", "loc_2", "loc_3"}};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     ASSERT_EQ(1, cmds.size());
     ASSERT_EQ("HDEL", cmds[0][0]);
@@ -434,8 +439,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpEmptyFieldMaps) {
     op.field_maps = {{}};
     op.locations = {{}};
 
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    backend_->CompileWriteOp(op, scratch);
+    const auto &cmds = scratch.all_cmds;
 
     ASSERT_EQ(1, cmds.size());
     ASSERT_EQ("DEL", cmds[0][0]);
@@ -460,6 +466,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchReusesNormalCapacityAndRele
     EXPECT_TRUE(normal.items.empty());
     EXPECT_TRUE(normal.all_cmds.empty());
     EXPECT_TRUE(normal.barriers.empty());
+    EXPECT_TRUE(normal.recycled_cmds.empty());
     EXPECT_EQ(item_capacity, normal.items.capacity());
     EXPECT_EQ(command_capacity, normal.all_cmds.capacity());
     EXPECT_EQ(barrier_capacity, normal.barriers.capacity());
@@ -472,6 +479,143 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchReusesNormalCapacityAndRele
     EXPECT_LE(oversized.items.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedItemCapacity);
     EXPECT_LE(oversized.all_cmds.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandCapacity);
     EXPECT_LE(oversized.barriers.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedBarrierCapacity);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchRecyclesCompactCommandStorageAcrossBatches) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    std::atomic<int> serialize_count{0};
+    auto make_compact_op = [&](KeyType key, const std::string &id, const std::string &json) {
+        auto location = std::make_shared<TrackingCacheLocation>(serialize_count, json);
+        location->set_id(id);
+        WriteOp op;
+        op.type = WriteOpType::kUpsertSingleLocation;
+        op.keys = {key};
+        op.single_locations = {std::move(location)};
+        return op;
+    };
+
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    auto first_op = make_compact_op(81, "first", "first-json");
+    backend_->CompileWriteOp(first_op, scratch);
+    ASSERT_EQ(1u, scratch.all_cmds.size());
+    ASSERT_EQ(4u, scratch.all_cmds[0].size());
+    auto *const first_storage = scratch.all_cmds[0].data();
+
+    scratch.ResetForPop();
+    ASSERT_EQ(1u, scratch.recycled_cmds.size());
+    EXPECT_TRUE(scratch.recycled_cmds[0].empty());
+    EXPECT_EQ(first_storage, scratch.recycled_cmds[0].data());
+
+    auto second_op = make_compact_op(82, "second", "second-json");
+    backend_->CompileWriteOp(second_op, scratch);
+    ASSERT_EQ(1u, scratch.all_cmds.size());
+    EXPECT_TRUE(scratch.recycled_cmds.empty());
+    EXPECT_EQ(first_storage, scratch.all_cmds[0].data());
+    EXPECT_THAT(scratch.all_cmds[0],
+                ElementsAre("HSET", "kvcache:instance_test_instance:cache_82", "L#second", "second-json"));
+    EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchBoundsRecyclerAndRejectsOversizedCommands) {
+    MetaAsyncRedisBackend::ConsumerScratch bounded;
+    for (size_t i = 0; i < MetaAsyncRedisBackend::ConsumerScratch::kRetainedRecycledCommandCount + 16; ++i) {
+        CmdArgs command;
+        command.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
+        command.assign({"HSET", "key", "field", "payload"});
+        bounded.all_cmds.emplace_back(std::move(command));
+    }
+    bounded.ResetForPop();
+    ASSERT_EQ(MetaAsyncRedisBackend::ConsumerScratch::kRetainedRecycledCommandCount,
+              bounded.recycled_cmds.size());
+    for (const auto &command : bounded.recycled_cmds) {
+        EXPECT_TRUE(command.empty());
+        EXPECT_LE(command.capacity(), MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity);
+    }
+
+    MetaAsyncRedisBackend::ConsumerScratch oversized;
+    CmdArgs delete_command;
+    delete_command.reserve(2);
+    delete_command.assign({"DEL", "key"});
+    oversized.all_cmds.emplace_back(std::move(delete_command));
+    CmdArgs multi_field_command;
+    multi_field_command.reserve(MetaAsyncRedisBackend::ConsumerScratch::kRetainedCommandArgCapacity + 2);
+    multi_field_command.assign({"HSET", "key", "f1", "v1", "f2", "v2"});
+    oversized.all_cmds.emplace_back(std::move(multi_field_command));
+    oversized.ResetForPop();
+    EXPECT_TRUE(oversized.recycled_cmds.empty());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerScratchMixedBatchesPreserveCommandsAndBarrierRanges) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+
+    StandardUri empty_uri;
+    auto client = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+    ON_CALL(*client, IsContextOk()).WillByDefault(Return(true));
+    ON_CALL(*client, Reconnect()).WillByDefault(Return(true));
+    std::vector<std::vector<CmdArgs>> observed_batches;
+    ON_CALL(*client, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        observed_batches.push_back(cmds);
+        std::vector<RedisClient::ReplyUPtr> replies;
+        for (size_t i = 0; i < cmds.size(); ++i) {
+            replies.emplace_back(MakeFakeReplyInteger(1));
+        }
+        return replies;
+    }));
+    backend_->consumer_clients_.push_back(std::move(client));
+
+    std::atomic<int> serialize_count{0};
+    auto make_compact_op = [&](KeyType key, const std::string &id, const std::string &json) {
+        auto location = std::make_shared<TrackingCacheLocation>(serialize_count, json);
+        location->set_id(id);
+        WriteOp op;
+        op.type = WriteOpType::kUpsertSingleLocation;
+        op.keys = {key};
+        op.single_locations = {std::move(location)};
+        return op;
+    };
+    auto make_delete_op = [](KeyType key) {
+        WriteOp op;
+        op.type = WriteOpType::kDelete;
+        op.keys = {key};
+        return op;
+    };
+
+    MetaAsyncRedisBackend::ConsumerScratch scratch;
+    auto first_barrier = std::make_shared<BarrierContext>();
+    first_barrier->remain.store(1, std::memory_order_release);
+    scratch.items.emplace_back(make_compact_op(91, "first", "first-json"));
+    scratch.items.emplace_back(SyncBarrierItem{first_barrier});
+    scratch.items.emplace_back(make_delete_op(92));
+    backend_->BatchFlush(0, scratch, 2);
+    ASSERT_EQ(1u, observed_batches.size());
+    EXPECT_THAT(observed_batches[0],
+                ElementsAre(ElementsAre("HSET", "kvcache:instance_test_instance:cache_91", "L#first", "first-json"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_92")));
+    ASSERT_EQ(1u, scratch.barriers.size());
+    EXPECT_EQ(0u, scratch.barriers[0].cmd_begin);
+    EXPECT_EQ(1u, scratch.barriers[0].cmd_end);
+    EXPECT_EQ(1, scratch.barriers[0].key_count);
+    EXPECT_TRUE(first_barrier->Wait(std::chrono::milliseconds{100}));
+
+    scratch.ResetForPop();
+    auto second_barrier = std::make_shared<BarrierContext>();
+    second_barrier->remain.store(1, std::memory_order_release);
+    scratch.items.emplace_back(make_delete_op(93));
+    scratch.items.emplace_back(SyncBarrierItem{second_barrier});
+    scratch.items.emplace_back(make_compact_op(94, "second", "second-json"));
+    backend_->BatchFlush(0, scratch, 2);
+    ASSERT_EQ(2u, observed_batches.size());
+    EXPECT_THAT(observed_batches[1],
+                ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_93"),
+                            ElementsAre(
+                                "HSET", "kvcache:instance_test_instance:cache_94", "L#second", "second-json")));
+    ASSERT_EQ(1u, scratch.barriers.size());
+    EXPECT_EQ(0u, scratch.barriers[0].cmd_begin);
+    EXPECT_EQ(1u, scratch.barriers[0].cmd_end);
+    EXPECT_EQ(1, scratch.barriers[0].key_count);
+    EXPECT_TRUE(second_barrier->Wait(std::chrono::milliseconds{100}));
+    EXPECT_EQ(2, serialize_count.load(std::memory_order_relaxed));
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwnedSnapshot) {

@@ -747,10 +747,35 @@ MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() 
 
 // ==================== Consumer Thread ====================
 
+MetaAsyncRedisBackend::ConsumerScratch::ConsumerScratch() {
+    recycled_cmds.reserve(kRetainedRecycledCommandCount);
+}
+
 void MetaAsyncRedisBackend::ConsumerScratch::ResetForPop() noexcept {
+    for (auto &cmd : all_cmds) {
+        if (recycled_cmds.size() >= kRetainedRecycledCommandCount) {
+            break;
+        }
+        if (cmd.size() == kRetainedCommandArgCapacity && cmd.capacity() == kRetainedCommandArgCapacity) {
+            cmd.clear();
+            recycled_cmds.emplace_back(std::move(cmd));
+        }
+    }
     ResetBoundedVector(items, kRetainedItemCapacity);
     ResetBoundedVector(all_cmds, kRetainedCommandCapacity);
     ResetBoundedVector(barriers, kRetainedBarrierCapacity);
+}
+
+MetaAsyncRedisBackend::CmdArgs &MetaAsyncRedisBackend::ConsumerScratch::AcquireCommand(size_t arg_count) {
+    CmdArgs command;
+    if (arg_count <= kRetainedCommandArgCapacity && !recycled_cmds.empty()) {
+        command = std::move(recycled_cmds.back());
+        recycled_cmds.pop_back();
+    }
+    all_cmds.emplace_back(std::move(command));
+    auto &active_command = all_cmds.back();
+    active_command.reserve(arg_count);
+    return active_command;
 }
 
 void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
@@ -772,17 +797,16 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
     KVCM_LOG_INFO("async redis consumer[%d] stopped, instance[%s]", queue_id, instance_id_.c_str());
 }
 
-void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds) {
+void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, ConsumerScratch &scratch) {
+    auto &cmds = scratch.all_cmds;
     if (op.type == WriteOpType::kUpsertSingleLocation) {
         for (size_t i = 0; i < op.keys.size(); ++i) {
             const auto &location = op.single_locations[i];
-            CmdArgs command;
-            command.reserve(4);
+            auto &command = scratch.AcquireCommand(4);
             command.emplace_back("HSET");
             command.emplace_back(cache_key_prefix_ + std::to_string(op.keys[i]));
             command.emplace_back(PROPERTY_LOCATION_PREFIX + location->id());
             command.emplace_back(location->ToJsonString());
-            cmds.emplace_back(std::move(command));
         }
         op.single_locations.clear();
         return;
@@ -831,7 +855,7 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, ConsumerScratch &scratch, i
     for (auto &item : scratch.items) {
         if (std::holds_alternative<WriteOp>(item)) {
             segment_key_count += static_cast<int64_t>(std::get<WriteOp>(item).keys.size());
-            CompileWriteOp(std::get<WriteOp>(item), all_cmds);
+            CompileWriteOp(std::get<WriteOp>(item), scratch);
         } else {
             auto &barrier = std::get<SyncBarrierItem>(item);
             barriers.push_back({barrier.barrier_ctx, segment_cmd_begin, all_cmds.size(), segment_key_count});
