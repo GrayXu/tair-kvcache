@@ -35,6 +35,12 @@ static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete
 static constexpr const char *kDeleteMetaOperation = "delete";
 static constexpr const char *kExistMetaOperation = "exist";
 static constexpr const char *kGetMetaOperation = "get";
+static constexpr std::uint32_t kRmwUpsertBackendMetrics = kBackendMetricIndexSerialize |
+                                                          kBackendMetricAsyncEnqueueTimeout |
+                                                          kBackendMetricAsyncEnqueueTime |
+                                                          kBackendMetricCacheUpsert;
+static constexpr std::uint32_t kRmwDeleteBackendMetrics =
+    kBackendMetricAsyncEnqueueTimeout | kBackendMetricAsyncEnqueueTime | kBackendMetricCacheDelete;
 // Local-backed prefix scans first inspect a bounded window so a short prefix
 // can cancel a million-key suffix promptly. Once that probe succeeds, larger
 // ranges preserve enough independent work for the query executor.
@@ -397,6 +403,7 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     int64_t lock_wait_time_us = 0;
     int64_t cache_backend_put_time_us = 0;
     for (auto &batch : batches) {
+        ScopedBackendMetricsScratch metrics_scratch(kBackendMetricCachePut);
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = backend_manager_->Put(request_context, batch);
@@ -432,6 +439,7 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     int64_t lock_wait_time_us = 0;
     int64_t cache_backend_delete_time_us = 0;
     for (auto &batch : batches) {
+        ScopedBackendMetricsScratch metrics_scratch(kBackendMetricCacheDelete);
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch.batch_keys);
         int64_t v = 0;
@@ -537,6 +545,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
         }
     }
     if (upsert_ecs.empty() || !existing_update_positions.empty()) {
+        ScopedBackendMetricsScratch metrics_scratch(kRmwUpsertBackendMetrics);
         ResetRmwUpsertMetrics(service_metrics_collector);
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch);
@@ -594,6 +603,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     }
     stats.delete_key_count += static_cast<int64_t>(delete_batch.batch_keys.size());
 
+    ScopedBackendMetricsScratch metrics_scratch(kRmwDeleteBackendMetrics);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, 0);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, 0);
@@ -708,16 +718,19 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         // 1. Read each key's existing location id list (no value deserialization)
         const auto &batch_keys = batch.batch_keys;
         auto &batch_location_ids = scratch.location_ids;
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
-        const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        scratch.get_ecs = backend_manager_->GetLocationIds(request_context, batch_keys, batch_location_ids);
+        {
+            ScopedBackendMetricsScratch metrics_scratch(kBackendMetricIndexDeserialize);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(
+                service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
+            const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
+            scratch.get_ecs = backend_manager_->GetLocationIds(request_context, batch_keys, batch_location_ids);
+            stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+            int64_t deserialize_time_us = 0;
+            KVCM_METRICS_COLLECTOR_GET_METRICS(
+                service_metrics_collector, meta_searcher, index_deserialize_time_us, deserialize_time_us);
+            stats.index_deserialize_time_us += deserialize_time_us;
+        }
         const auto &get_ecs = scratch.get_ecs;
-        stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
-        int64_t deserialize_time_us = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(
-            service_metrics_collector, meta_searcher, index_deserialize_time_us, deserialize_time_us);
-        stats.index_deserialize_time_us += deserialize_time_us;
         stats.has_index_deserialize = true;
         if (get_ecs.size() != batch_keys.size() || batch_location_ids.size() != batch_keys.size()) {
             PREFIX_INDEXER_LOG(ERROR,
@@ -861,34 +874,37 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         const auto &batch_keys = batch.batch_keys;
         auto &batch_locations_per_key = scratch.locations;
         auto &batch_key_get_ecs = scratch.key_get_ecs;
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
-        const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         auto &refresh_results = scratch.refresh_results;
-        if (refresh_cache_from_persistent) {
-            // Maintenance candidates originate from the persistent scan. Under
-            // the same shard lock as the CAS, replace a missing or stale hot
-            // cache entry with the complete source-of-truth key first.
-            refresh_results = backend_manager_->RefreshCacheFromPersistent(request_context, batch_keys);
-        }
-        if (track_created_key_count) {
-            backend_manager_->GetLocationsWithKeyStatusInto(request_context,
-                                                            batch_keys,
-                                                            batch.batch_location_ids,
-                                                            batch_locations_per_key,
-                                                            scratch.get_ecs,
-                                                            batch_key_get_ecs,
-                                                            targeted_read_scratch);
-        } else {
-            scratch.get_ecs = backend_manager_->GetLocations(
-                request_context, batch_keys, batch.batch_location_ids, batch_locations_per_key);
+        {
+            ScopedBackendMetricsScratch metrics_scratch(kBackendMetricIndexDeserialize);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(
+                service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
+            const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
+            if (refresh_cache_from_persistent) {
+                // Maintenance candidates originate from the persistent scan. Under
+                // the same shard lock as the CAS, replace a missing or stale hot
+                // cache entry with the complete source-of-truth key first.
+                refresh_results = backend_manager_->RefreshCacheFromPersistent(request_context, batch_keys);
+            }
+            if (track_created_key_count) {
+                backend_manager_->GetLocationsWithKeyStatusInto(request_context,
+                                                                batch_keys,
+                                                                batch.batch_location_ids,
+                                                                batch_locations_per_key,
+                                                                scratch.get_ecs,
+                                                                batch_key_get_ecs,
+                                                                targeted_read_scratch);
+            } else {
+                scratch.get_ecs = backend_manager_->GetLocations(
+                    request_context, batch_keys, batch.batch_location_ids, batch_locations_per_key);
+            }
+            stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+            int64_t v = 0;
+            KVCM_METRICS_COLLECTOR_GET_METRICS(
+                service_metrics_collector, meta_searcher, index_deserialize_time_us, v);
+            stats.index_deserialize_time_us += v;
         }
         auto &get_ecs_per_key = scratch.get_ecs;
-        stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
-        int64_t v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(
-            service_metrics_collector, meta_searcher, index_deserialize_time_us, v);
-        stats.index_deserialize_time_us += v;
         stats.has_index_deserialize = true;
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
@@ -1287,6 +1303,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
 
         const bool capacity_exceeded = new_key_count + GetKeyCount() > max_key_count_;
         if (!capacity_exceeded) {
+            ScopedBackendMetricsScratch metrics_scratch(kRmwUpsertBackendMetrics);
             ResetRmwUpsertMetrics(service_metrics_collector);
             const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
             // The read result is dead after modifier evaluation. Reuse its
@@ -1341,6 +1358,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
             upsert_read_indices.resize(existing_count);
 
             if (existing_count > 0) {
+                ScopedBackendMetricsScratch metrics_scratch(kRmwUpsertBackendMetrics);
                 ResetRmwUpsertMetrics(service_metrics_collector);
                 const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
                 // The get result vector is dead after modifier evaluation and

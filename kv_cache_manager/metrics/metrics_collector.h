@@ -236,6 +236,82 @@ private:                                                                        
     DECLARE_METRICS_GAUGE_(group, name);
 #endif
 
+enum BackendMetricsField : std::uint32_t {
+    kBackendMetricIndexSerialize = 1U << 0,
+    kBackendMetricIndexDeserialize = 1U << 1,
+    kBackendMetricAsyncEnqueueTimeout = 1U << 2,
+    kBackendMetricAsyncEnqueueTime = 1U << 3,
+    kBackendMetricCachePut = 1U << 4,
+    kBackendMetricCacheUpsert = 1U << 5,
+    kBackendMetricCacheDelete = 1U << 6,
+    kAllBackendMetrics = (1U << 7) - 1,
+};
+
+struct BackendMetricsScratch {
+    explicit BackendMetricsScratch(std::uint32_t captured_fields) noexcept : captured_fields(captured_fields) {}
+
+    [[nodiscard]] bool Captures(BackendMetricsField field) const noexcept {
+        return (captured_fields & static_cast<std::uint32_t>(field)) != 0;
+    }
+
+    std::uint32_t captured_fields;
+    double meta_searcher_index_serialize_time_us{0.};
+    double meta_searcher_index_deserialize_time_us{0.};
+    double meta_indexer_async_enqueue_timeout_key_count{0.};
+    double meta_indexer_async_enqueue_time_us{0.};
+    double meta_indexer_cache_backend_put_time_us{0.};
+    double meta_indexer_cache_backend_upsert_time_us{0.};
+    double meta_indexer_cache_backend_delete_time_us{0.};
+};
+
+// RMW reads several lower-layer Gauge samples back to build one request
+// aggregate. The underlying collector is shared by instance/type, so these
+// synchronous backend sections bind stack storage instead of using registry
+// Gauges as scratch. Nested sections restore the previous binding.
+class ScopedBackendMetricsScratch {
+public:
+    explicit ScopedBackendMetricsScratch(std::uint32_t captured_fields) noexcept
+        : scratch_(captured_fields), previous_(current_) {
+        current_ = &scratch_;
+    }
+    ~ScopedBackendMetricsScratch() { current_ = previous_; }
+
+    ScopedBackendMetricsScratch(const ScopedBackendMetricsScratch &) = delete;
+    ScopedBackendMetricsScratch &operator=(const ScopedBackendMetricsScratch &) = delete;
+
+    [[nodiscard]] static BackendMetricsScratch *Current() noexcept {
+        return current_;
+    }
+
+private:
+    inline static thread_local BackendMetricsScratch *current_{nullptr};
+    BackendMetricsScratch scratch_;
+    BackendMetricsScratch *previous_;
+};
+
+#ifndef KVCM_BACKEND_SCRATCH_GAUGE_METRICS
+#define KVCM_BACKEND_SCRATCH_GAUGE_METRICS(group, name, field)                                                        \
+public:                                                                                                                \
+    DECLARE_METRICS_NAME_(group, name);                                                                                \
+    DEFINE_COPY_METRICS_GAUGE_(group, name)                                                                            \
+    void set_##group##_##name##_metrics(double value) {                                                               \
+        auto *scratch = ScopedBackendMetricsScratch::Current();                                                        \
+        if (scratch && scratch->Captures(field)) {                                                                     \
+            scratch->group##_##name = value;                                                                           \
+        } else {                                                                                                       \
+            METRICS_(group, name) = value;                                                                             \
+        }                                                                                                              \
+    }                                                                                                                  \
+    [[nodiscard]] double get_##group##_##name##_metrics() const {                                                      \
+        const auto *scratch = ScopedBackendMetricsScratch::Current();                                                  \
+        return scratch && scratch->Captures(field) ? scratch->group##_##name : METRICS_(group, name).Get();            \
+    }                                                                                                                  \
+    DEFINE_STEAL_METRICS_GAUGE_(group, name)                                                                           \
+                                                                                                                       \
+private:                                                                                                               \
+    DECLARE_METRICS_GAUGE_(group, name);
+#endif
+
 #ifndef KVCM_CHRONO_METRICS
 #define KVCM_CHRONO_METRICS(group, name, method)                                                                       \
     KVCM_GAUGE_METRICS(group, name)                                                                                    \
@@ -306,8 +382,8 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_CHRONO_METRICS(meta_searcher,
                         indexer_read_modify_write_location_time_us,
                         MetaSearcherIndexerReadModifyWriteLocation)
-    KVCM_GAUGE_METRICS(meta_searcher, index_serialize_time_us)
-    KVCM_GAUGE_METRICS(meta_searcher, index_deserialize_time_us)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_searcher, index_serialize_time_us, kBackendMetricIndexSerialize)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_searcher, index_deserialize_time_us, kBackendMetricIndexDeserialize)
     KVCM_GAUGE_METRICS(meta_searcher, indexer_query_times)
 
     // meta indexer metrics
@@ -329,11 +405,12 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_update_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_skip_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_delete_key_count)
-    KVCM_GAUGE_METRICS(meta_indexer, async_enqueue_timeout_key_count)
-    KVCM_GAUGE_METRICS(meta_indexer, async_enqueue_time_us)
-    KVCM_GAUGE_METRICS(meta_indexer, cache_backend_put_time_us)
-    KVCM_GAUGE_METRICS(meta_indexer, cache_backend_upsert_time_us)
-    KVCM_GAUGE_METRICS(meta_indexer, cache_backend_delete_time_us)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(
+        meta_indexer, async_enqueue_timeout_key_count, kBackendMetricAsyncEnqueueTimeout)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_indexer, async_enqueue_time_us, kBackendMetricAsyncEnqueueTime)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_indexer, cache_backend_put_time_us, kBackendMetricCachePut)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_indexer, cache_backend_upsert_time_us, kBackendMetricCacheUpsert)
+    KVCM_BACKEND_SCRATCH_GAUGE_METRICS(meta_indexer, cache_backend_delete_time_us, kBackendMetricCacheDelete)
 
 public:
     ServiceMetricsCollector() = delete;

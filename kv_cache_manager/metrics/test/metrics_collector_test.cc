@@ -166,6 +166,85 @@ TEST_F(MetricsCollectorTest, MetaSearcherMetricsTest) {
     EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_location_time_us), 1000.0);
 }
 
+TEST_F(MetricsCollectorTest, BackendMetricsScratchIsScopedAndReentrant) {
+    auto collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(collector->Init());
+    SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, 300.);
+    SET_METRICS_(collector, meta_indexer, cache_backend_put_time_us, 301.);
+
+    {
+        ScopedBackendMetricsScratch outer(kAllBackendMetrics);
+        SET_METRICS_(collector, meta_searcher, index_serialize_time_us, 101.);
+        SET_METRICS_(collector, meta_indexer, async_enqueue_timeout_key_count, 11.);
+        SET_METRICS_(collector, meta_indexer, async_enqueue_time_us, 102.);
+        SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, 103.);
+        SET_METRICS_(collector, meta_searcher, index_deserialize_time_us, 104.);
+        SET_METRICS_(collector, meta_indexer, cache_backend_put_time_us, 105.);
+        SET_METRICS_(collector, meta_indexer, cache_backend_delete_time_us, 106.);
+        EXPECT_DOUBLE_EQ(101., GET(collector, meta_searcher, index_serialize_time_us));
+        EXPECT_DOUBLE_EQ(11., GET(collector, meta_indexer, async_enqueue_timeout_key_count));
+        EXPECT_DOUBLE_EQ(102., GET(collector, meta_indexer, async_enqueue_time_us));
+        EXPECT_DOUBLE_EQ(103., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+        EXPECT_DOUBLE_EQ(104., GET(collector, meta_searcher, index_deserialize_time_us));
+        EXPECT_DOUBLE_EQ(105., GET(collector, meta_indexer, cache_backend_put_time_us));
+        EXPECT_DOUBLE_EQ(106., GET(collector, meta_indexer, cache_backend_delete_time_us));
+
+        {
+            ScopedBackendMetricsScratch inner(kBackendMetricCacheUpsert);
+            SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, 203.);
+            EXPECT_DOUBLE_EQ(203., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+        }
+        EXPECT_DOUBLE_EQ(103., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+    }
+
+    EXPECT_DOUBLE_EQ(300., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+    SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, 400.);
+    EXPECT_DOUBLE_EQ(400., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+
+    SET_METRICS_(collector, meta_indexer, async_enqueue_time_us, 500.);
+    {
+        ScopedBackendMetricsScratch cache_put_only(kBackendMetricCachePut);
+        SET_METRICS_(collector, meta_indexer, cache_backend_put_time_us, 501.);
+        SET_METRICS_(collector, meta_indexer, async_enqueue_time_us, 502.);
+        EXPECT_DOUBLE_EQ(501., GET(collector, meta_indexer, cache_backend_put_time_us));
+        EXPECT_DOUBLE_EQ(502., GET(collector, meta_indexer, async_enqueue_time_us));
+    }
+    EXPECT_DOUBLE_EQ(301., GET(collector, meta_indexer, cache_backend_put_time_us));
+    EXPECT_DOUBLE_EQ(502., GET(collector, meta_indexer, async_enqueue_time_us));
+}
+
+TEST_F(MetricsCollectorTest, BackendMetricsScratchIsThreadLocal) {
+    auto collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(collector->Init());
+    SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, 300.);
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> read_samples{false};
+    double observed[2] = {0., 0.};
+    auto worker = [&](size_t index, double value) {
+        ScopedBackendMetricsScratch metrics_scratch(kBackendMetricCacheUpsert);
+        SET_METRICS_(collector, meta_indexer, cache_backend_upsert_time_us, value);
+        ready.fetch_add(1, std::memory_order_release);
+        while (!read_samples.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        observed[index] = GET(collector, meta_indexer, cache_backend_upsert_time_us);
+    };
+
+    std::thread first(worker, 0, 100.);
+    std::thread second(worker, 1, 200.);
+    while (ready.load(std::memory_order_acquire) != 2) {
+        std::this_thread::yield();
+    }
+    read_samples.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+
+    EXPECT_DOUBLE_EQ(100., observed[0]);
+    EXPECT_DOUBLE_EQ(200., observed[1]);
+    EXPECT_DOUBLE_EQ(300., GET(collector, meta_indexer, cache_backend_upsert_time_us));
+}
+
 // Test Manager metrics functionality
 TEST_F(MetricsCollectorTest, ManagerMetricsTest) {
     metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
