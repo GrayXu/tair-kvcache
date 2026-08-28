@@ -2954,6 +2954,7 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         out_missing_targets->resize(keys.size());
     }
 
+    bool use_single_location_fast_path = meta_indexer_->SupportsSingleLocationRmw();
     std::unordered_set<int64_t> seen_keys;
     bool invalid_input = false;
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
@@ -2964,6 +2965,8 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         if (!seen_keys.insert(keys[key_index]).second) {
             invalid_input = true;
         }
+        use_single_location_fast_path = use_single_location_fast_path && tasks_per_key[key_index].size() == 1 &&
+                                        tasks_per_key[key_index][0].spec_names.size() == 1;
         std::unordered_set<std::string_view> seen_location_ids;
         if (tasks_per_key[key_index].size() > 1) {
             seen_location_ids.reserve(tasks_per_key[key_index].size());
@@ -2980,6 +2983,143 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
             std::fill(per_key_results.begin(), per_key_results.end(), EC_BADARGS);
         }
         return EC_BADARGS;
+    }
+
+    if (use_single_location_fast_path) {
+        LocationIdRefVector location_ids;
+        location_ids.reserve(keys.size());
+        for (const auto &tasks : tasks_per_key) {
+            location_ids.push_back(&tasks[0].ResolvedLocationId());
+        }
+
+        std::vector<std::pair<DataStorageType, std::uint64_t>> deleted_specs_size(
+            keys.size(), {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0});
+        std::vector<std::uint8_t> missing_targets(keys.size(), 0);
+        bool write_lease_attempted = false;
+        ErrorCode write_lease_ec = EC_OK;
+        MetadataWriteLease write_lease;
+        auto ensure_write_lease =
+            [&acquire_write_lease, &write_lease_attempted, &write_lease_ec, &write_lease]() -> ErrorCode {
+            if (acquire_write_lease && !write_lease_attempted) {
+                std::tie(write_lease_ec, write_lease) = acquire_write_lease();
+                write_lease_attempted = true;
+            }
+            return write_lease_ec;
+        };
+
+        auto modifier = [&keys,
+                         &tasks_per_key,
+                         &deleted_specs_size,
+                         &missing_targets,
+                         &ensure_write_lease](ErrorCode get_ec,
+                                              const LocationId &location_id,
+                                              size_t key_index,
+                                              const CacheLocation *existing_location,
+                                              CacheLocationConstPtr &out_location) -> ModifierResult {
+            const ErrorCode lease_ec = ensure_write_lease();
+            if (lease_ec != EC_OK) {
+                return {ModifierAction::MA_FAIL, lease_ec};
+            }
+            if (key_index >= keys.size() || key_index >= tasks_per_key.size() ||
+                tasks_per_key[key_index].size() != 1 || tasks_per_key[key_index][0].spec_names.size() != 1) {
+                return {ModifierAction::MA_FAIL, ErrorCode::EC_MISMATCH};
+            }
+
+            const auto &task = tasks_per_key[key_index][0];
+            const std::string &delete_spec_name = task.spec_names[0];
+            if (delete_spec_name.empty() || task.ResolvedLocationId() != location_id) {
+                return {ModifierAction::MA_SKIP, ErrorCode::EC_BADARGS};
+            }
+            if (get_ec != ErrorCode::EC_OK) {
+                if (get_ec == ErrorCode::EC_NOENT) {
+                    missing_targets[key_index] = 1;
+                    return {ModifierAction::MA_SKIP, ErrorCode::EC_OK};
+                }
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              location_id.c_str(),
+                              get_ec);
+                return {ModifierAction::MA_SKIP, get_ec};
+            }
+            if (!existing_location) {
+                missing_targets[key_index] = 1;
+                return {ModifierAction::MA_SKIP, ErrorCode::EC_OK};
+            }
+
+            const auto &existing_specs = existing_location->location_specs();
+            size_t deleted_spec_count = 0;
+            std::uint64_t removed_size = 0;
+            for (const auto &spec : existing_specs) {
+                if (spec.name() == delete_spec_name) {
+                    ++deleted_spec_count;
+                    removed_size += GetLocationSpecSize(spec);
+                }
+            }
+            if (deleted_spec_count == 0) {
+                return {ModifierAction::MA_SKIP, ErrorCode::EC_OK};
+            }
+
+            deleted_specs_size[key_index] = std::make_pair(existing_location->type(), removed_size);
+            if (deleted_spec_count == existing_specs.size()) {
+                return {ModifierAction::MA_DELETE, ErrorCode::EC_OK};
+            }
+
+            std::vector<LocationSpec> kept_specs;
+            kept_specs.reserve(existing_specs.size() - deleted_spec_count);
+            for (const auto &spec : existing_specs) {
+                if (spec.name() != delete_spec_name) {
+                    kept_specs.emplace_back(spec.name(), spec.uri());
+                }
+            }
+
+            std::uint64_t validated_total_size = 0;
+            const bool old_specs_validated = existing_location->GetValidatedTotalSize(validated_total_size);
+            auto new_location = std::make_shared<CacheLocation>(*existing_location);
+            if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+                new_location->set_id(*interned_location_id);
+            }
+            new_location->set_location_specs(std::move(kept_specs));
+            new_location->set_spec_size(new_location->location_specs().size());
+            if (old_specs_validated && removed_size <= validated_total_size) {
+                new_location->set_validated_total_size(validated_total_size - removed_size);
+            }
+            out_location = std::move(new_location);
+            return {ModifierAction::MA_OK, ErrorCode::EC_OK};
+        };
+
+        auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector,
+                                                 MetaSearcherIndexerReadModifyWriteLocation);
+        auto result = meta_indexer_->ReadModifyWriteSingleTargetLocationsWithDelete(
+            request_context, keys, location_ids, modifier);
+        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector,
+                                               MetaSearcherIndexerReadModifyWriteLocation);
+
+        bool malformed_result = result.error_codes.size() != keys.size();
+        if (malformed_result) {
+            KVCM_LOG_ERROR("BatchDeleteLocationSpecs compact result size mismatch, keys[%zu], results[%zu]",
+                           keys.size(),
+                           result.error_codes.size());
+        }
+        for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+            const ErrorCode ec =
+                key_index < result.error_codes.size() ? result.error_codes[key_index] : ErrorCode::EC_MISMATCH;
+            out_batch_results[key_index][0] = ec;
+            if (out_missing_targets) {
+                (*out_missing_targets)[key_index][0] = missing_targets[key_index] != 0;
+            }
+            if (ec == ErrorCode::EC_OK &&
+                deleted_specs_size[key_index].first != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+                meta_indexer_->SubStorageUsageByType(deleted_specs_size[key_index].first,
+                                                     deleted_specs_size[key_index].second);
+            }
+        }
+
+        if (result.ec != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteSingleTargetLocationsWithDelete failed, ec: %d", result.ec);
+        }
+        return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
     }
 
     // 每个 DeleteLocationSpecsTask 需要独立返回结果。一个 key 下的 location

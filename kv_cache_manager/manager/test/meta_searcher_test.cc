@@ -2119,12 +2119,14 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
         {location_id,
          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
-         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
-          LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem"),
-          LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=1"),
+          LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem?size=2"),
+          LocationSpec("full_3", "event_report://127.0.0.1:8080/mem?size=3")}},
     }};
     std::vector<ErrorCode> per_key_ec;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    EXPECT_EQ(6u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 
     std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
         {location_id, {"linear_0"}},
@@ -2147,6 +2149,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
     EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
     EXPECT_TRUE(location_maps[0].at(location_id)->HasValidatedLocationSpecs());
+    EXPECT_EQ(5u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 
     delete_tasks = {{
         {location_id, {"linear_1", "full_3"}},
@@ -2158,6 +2162,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_TRUE(location_maps[0].empty());
+    EXPECT_EQ(0u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 
     delete_tasks = {{
         {location_id, {}},
@@ -2170,6 +2176,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_FALSE(location_maps[0].empty());
+    EXPECT_EQ(6u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteFinalLocationsReclaimsDuplicateKeyOnce) {
@@ -2334,9 +2342,11 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData)
         {location_id,
          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
-         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=4")}},
     }};
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    EXPECT_EQ(4u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     std::vector<std::vector<ErrorCode>> delete_results;
     std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
@@ -2373,6 +2383,20 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData)
     const auto &specs = location_maps[0].at(location_id)->location_specs();
     ASSERT_EQ(1u, specs.size());
     EXPECT_EQ("linear_0", specs[0].name());
+    EXPECT_EQ(4u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    delete_tasks = {{{location_id, {"linear_0"}}}};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(
+                  request_context_.get(), keys, delete_tasks, delete_results, &missing_targets));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
+    ASSERT_EQ((std::vector<bool>{false}), missing_targets[0]);
+    EXPECT_EQ(0u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
 }
 
 TEST_F(MetaSearcherTest, TestBatchMutationWriteLeaseIsAcquiredOncePerRmwPhase) {

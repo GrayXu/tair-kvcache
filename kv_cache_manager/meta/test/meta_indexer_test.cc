@@ -674,6 +674,210 @@ TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemant
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), skip_result.error_codes);
     EXPECT_EQ(1u, skip_calls);
     EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    const auto unsupported_delete_result = meta_indexer_->ReadModifyWriteSingleTargetLocations(
+        request_context_.get(),
+        {1},
+        LocationIdRefVector{&target_id},
+        [](ErrorCode get_ec,
+           const LocationId &,
+           size_t,
+           const CacheLocation *existing_location,
+           CacheLocationConstPtr &) {
+            EXPECT_EQ(EC_OK, get_ec);
+            EXPECT_NE(nullptr, existing_location);
+            return ModifierResult{MA_DELETE, EC_OK};
+        });
+    EXPECT_EQ(EC_ERROR, unsupported_delete_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}), unsupported_delete_result.error_codes);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+}
+
+TEST_F(MetaIndexerTest, TestSingleTargetDeleteRmwSupportsUpdateDeleteAndSkip) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "batch_key_size" : 1,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+    ASSERT_TRUE(meta_indexer_->SupportsSingleLocationRmw());
+
+    KeyVector keys;
+    std::set<int32_t> selected_shards;
+    for (KeyType key = 11; key < 10000 && keys.size() < 4; ++key) {
+        if (selected_shards.insert(meta_indexer_->GetMutexShardIndex(key)).second) {
+            keys.push_back(key);
+        }
+    }
+    ASSERT_EQ(4u, keys.size());
+
+    const std::string target_id = "target";
+    auto final_target = std::make_shared<CacheLocation>();
+    final_target->set_id(target_id);
+    final_target->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    final_target->set_location_specs({LocationSpec("tp0", "event_report://delete-final/mem?size=1")});
+    final_target->set_spec_size(1);
+    final_target->set_validated_total_size(1);
+
+    auto partial_target = std::make_shared<CacheLocation>();
+    partial_target->set_id(target_id);
+    partial_target->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    partial_target->set_location_specs({LocationSpec("tp0", "event_report://delete-partial/mem?size=1"),
+                                        LocationSpec("tp1", "event_report://delete-partial/mem?size=2")});
+    partial_target->set_spec_size(2);
+    partial_target->set_validated_total_size(3);
+
+    const std::string sibling_id = "sibling";
+    auto sibling = std::make_shared<CacheLocation>();
+    sibling->set_id(sibling_id);
+    sibling->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    sibling->set_location_specs({LocationSpec("tp0", "event_report://delete-sibling/mem?size=1")});
+    sibling->set_spec_size(1);
+    sibling->set_validated_total_size(1);
+
+    CacheLocationMapVector seed_locations(3);
+    seed_locations[0].emplace(target_id, final_target);
+    seed_locations[1].emplace(target_id, partial_target);
+    seed_locations[2].emplace(target_id, final_target);
+    seed_locations[2].emplace(sibling_id, sibling);
+    PropertyMapVector seed_properties(3);
+    const auto put_result = meta_indexer_->Put(
+        request_context_.get(), {keys[0], keys[1], keys[2]}, seed_locations, seed_properties);
+    ASSERT_EQ(EC_OK, put_result.ec);
+    ASSERT_EQ(3u, meta_indexer_->GetKeyCount());
+
+    const LocationIdRefVector target_ids{&target_id, &target_id, &target_id, &target_id};
+    size_t modifier_calls = 0;
+    const auto result = meta_indexer_->ReadModifyWriteSingleTargetLocationsWithDelete(
+        request_context_.get(),
+        keys,
+        target_ids,
+        [&modifier_calls](ErrorCode get_ec,
+                          const LocationId &,
+                          size_t key_index,
+                          const CacheLocation *existing_location,
+                          CacheLocationConstPtr &out_location) -> ModifierResult {
+            ++modifier_calls;
+            if (key_index == 0 || key_index == 2) {
+                EXPECT_EQ(EC_OK, get_ec);
+                EXPECT_NE(nullptr, existing_location);
+                return {MA_DELETE, EC_OK};
+            }
+            if (key_index == 1) {
+                EXPECT_EQ(EC_OK, get_ec);
+                if (!existing_location) {
+                    ADD_FAILURE() << "expected an existing target location";
+                    return {MA_FAIL, EC_MISMATCH};
+                }
+                auto replacement = std::make_shared<CacheLocation>(*existing_location);
+                replacement->set_location_specs({LocationSpec("tp1", "event_report://delete-partial/mem?size=2")});
+                replacement->set_spec_size(1);
+                replacement->set_validated_total_size(2);
+                out_location = std::move(replacement);
+                return {MA_OK, EC_OK};
+            }
+            EXPECT_EQ(EC_NOENT, get_ec);
+            EXPECT_EQ(nullptr, existing_location);
+            return {MA_SKIP, EC_OK};
+        });
+
+    EXPECT_EQ(EC_OK, result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_OK}), result.error_codes);
+    EXPECT_EQ(4u, modifier_calls);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    CacheLocationMapVector stored_locations;
+    const auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, stored_locations);
+    EXPECT_EQ(EC_PARTIAL_OK, get_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK, EC_OK, EC_NOENT}), get_result.error_codes);
+    EXPECT_TRUE(stored_locations[0].empty());
+    ASSERT_EQ(1u, stored_locations[1].size());
+    ASSERT_EQ(1u, stored_locations[1].at(target_id)->location_specs().size());
+    EXPECT_EQ("tp1", stored_locations[1].at(target_id)->location_specs()[0].name());
+    ASSERT_EQ(1u, stored_locations[2].size());
+    EXPECT_EQ(1u, stored_locations[2].count(sibling_id));
+    EXPECT_TRUE(stored_locations[3].empty());
+}
+
+TEST_F(MetaIndexerTest, TestSingleTargetDeleteRmwRejectsMissingUpsertAndAggregatesFailure) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "batch_key_size" : 100,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    const std::string target_id = "target";
+    auto target = std::make_shared<CacheLocation>();
+    target->set_id(target_id);
+    CacheLocationMapVector seed_locations(4);
+    seed_locations[0].emplace(target_id, target);
+    seed_locations[1].emplace(target_id, target);
+    seed_locations[2].emplace(target_id, target);
+    seed_locations[3].emplace(target_id, target);
+    PropertyMapVector seed_properties(4);
+    const KeyVector keys{21, 22, 23, 24, 25};
+    const auto put_result = meta_indexer_->Put(
+        request_context_.get(), {keys[0], keys[2], keys[3], keys[4]}, seed_locations, seed_properties);
+    ASSERT_EQ(EC_OK, put_result.ec);
+    ASSERT_EQ(4u, meta_indexer_->GetKeyCount());
+
+    const LocationIdRefVector target_ids{&target_id, &target_id, &target_id, &target_id, &target_id};
+    const auto result = meta_indexer_->ReadModifyWriteSingleTargetLocationsWithDelete(
+        request_context_.get(),
+        keys,
+        target_ids,
+        [](ErrorCode get_ec,
+           const LocationId &location_id,
+           size_t key_index,
+           const CacheLocation *,
+           CacheLocationConstPtr &out_location) -> ModifierResult {
+            if (key_index == 0) {
+                EXPECT_EQ(EC_OK, get_ec);
+                return {MA_DELETE, EC_OK};
+            }
+            if (key_index == 1) {
+                EXPECT_EQ(EC_NOENT, get_ec);
+                auto replacement = std::make_shared<CacheLocation>();
+                replacement->set_id(location_id);
+                out_location = std::move(replacement);
+                return {MA_OK, EC_OK};
+            }
+            if (key_index == 2) {
+                EXPECT_EQ(EC_OK, get_ec);
+                return {MA_FAIL, EC_ERROR};
+            }
+            if (key_index == 3) {
+                EXPECT_EQ(EC_OK, get_ec);
+                auto replacement = std::make_shared<CacheLocation>();
+                replacement->set_id(location_id);
+                out_location = std::move(replacement);
+                return {MA_OK, EC_OK};
+            }
+            EXPECT_EQ(EC_OK, get_ec);
+            return {MA_DELETE, EC_BADARGS};
+        });
+
+    EXPECT_EQ(EC_PARTIAL_OK, result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_MISMATCH, EC_ERROR, EC_OK, EC_BADARGS}), result.error_codes);
+    EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+
+    CacheLocationMapVector stored_locations;
+    const auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, stored_locations);
+    EXPECT_EQ(EC_PARTIAL_OK, get_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT, EC_OK, EC_OK, EC_OK}), get_result.error_codes);
+    EXPECT_TRUE(stored_locations[0].empty());
+    EXPECT_TRUE(stored_locations[1].empty());
+    ASSERT_EQ(1u, stored_locations[2].size());
+    EXPECT_EQ(1u, stored_locations[2].count(target_id));
+    ASSERT_EQ(1u, stored_locations[3].size());
+    EXPECT_EQ(1u, stored_locations[3].count(target_id));
+    ASSERT_EQ(1u, stored_locations[4].size());
+    EXPECT_EQ(1u, stored_locations[4].count(target_id));
 }
 
 // Verifies the invariants of MakeBatches() that callers rely on, regardless

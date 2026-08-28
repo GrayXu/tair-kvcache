@@ -127,6 +127,14 @@ public:
                                                               const KeyVector &keys,
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
+    // DELETE-only one-target RMW. Unlike the upsert entry above, this accepts
+    // MA_DELETE and reads an owned immutable location value, so its modifier
+    // never depends on a retained cache handle for object lifetime.
+    SingleLocationResult ReadModifyWriteSingleTargetLocationsWithDelete(
+        RequestContext *request_context,
+        const KeyVector &keys,
+        const LocationIdRefVector &location_ids,
+        const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
 
     // ---------- READ ----------
@@ -199,6 +207,18 @@ public:
 
 private:
     class ScopedBatchLock;
+
+    enum class SingleLocationRmwMode {
+        kUpsertOnly,
+        kDelete,
+    };
+
+    template <SingleLocationRmwMode Mode>
+    SingleLocationResult ReadModifyWriteSingleTargetLocationsImpl(
+        RequestContext *request_context,
+        const KeyVector &keys,
+        const LocationIdRefVector &location_ids,
+        const SingleLocationModifierFunc &modifier) noexcept;
 
     LocationResult ReadModifyWriteLocationImpl(RequestContext *request_context,
                                                const KeyVector &keys,
