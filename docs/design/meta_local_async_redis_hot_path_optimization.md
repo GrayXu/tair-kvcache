@@ -150,7 +150,7 @@ flowchart LR
     B --> C["metadata shard mutex"]
     C --> D["逐 key targeted local Get"]
     D --> E["modifier"]
-    E --> F["Async Redis TLS queue buckets 入队"]
+    E --> F["Async Redis TLS routing scratch 入队"]
     F --> G["consume conditional local Upsert<br/>move + cached size + fused release"]
     G --> H["释放 metadata shard mutex"]
     H --> I["RAII 锁外清理 payload"]
@@ -412,27 +412,43 @@ LRU 时序；这也是 conditional/pure-local fast path 与通用 unconditional 
 **适用链路：** `MetaAsyncRedisBackend` 的 Put/Upsert/Delete/DeleteLocations；是否配置 local cache 不影响 fan-out
 自身，但只有 cached RMW 会把它放在 metadata mutex 内。
 
-保持 `GetQueueIndexForKey`、`WaitForQueueCapacity`、sub-op move 和 MPSC Push，只把当前 request-local
-`unordered_map<int, vector<size_t>>` 换成 producer thread-local queue buckets：
+保持 `GetQueueIndexForKey`、`WaitForQueueCapacity`、sub-op move 和 MPSC Push。queue count 较小时，producer
+thread-local `vector<vector<size_t>>` buckets 已足够；但 q512 + batch32 下单次操作通常只命中约 30 个 queue，逐请求
+清空并遍历全部 512 个 slot 会成为 metadata mutex 内的无效 producer 开销。因此 q512 实验改为有界的 flat sparse
+routing scratch：
 
 ```cpp
-thread_local std::vector<std::vector<size_t>> queue_indices;
+struct EnqueueRoutingScratch {
+    vector<int> queue_ids;
+    vector<size_t> queue_counts;
+    vector<size_t> queue_starts;
+    vector<size_t> queue_cursors;
+    vector<size_t> ordered_indices;
+    vector<int> touched_queues;
+};
 
-queue_indices.resize(queue_count_);
-for (auto &indices : queue_indices) {
-    indices.clear();
-}
 for (size_t i = 0; i < op.keys.size(); ++i) {
-    queue_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
+    int queue_id = GetQueueIndexForKey(op.keys[i]);
+    queue_ids[i] = queue_id;
+    if (queue_counts[queue_id] == 0) {
+        touched_queues.push_back(queue_id);
+    }
+    ++queue_counts[queue_id];
+}
+
+for (int queue_id : touched_queues) {
+    // Build one stable input-index range and one sub-op for this queue only.
 }
 ```
 
-随后按 queue id 顺序遍历非空 bucket，完全复用现有 sub-op reserve/move、timeout error 回填和 Push。每个 bucket 的
-capacity 在线程内跨请求复用，去掉 unordered_map 节点；不增加 counts、offsets、cursors、queue_ids、stable scatter
-和 occupied queue 容器。
+scratch 只清上一次 `touched_queues` 对应的 count；queue count 改变时重新初始化 queue-shaped arrays。两次稳定填充先
+计算每个 touched queue 的 range，再按原输入顺序写入 `ordered_indices`，从而保持同 queue 内 key/payload 对齐和 FIFO；
+timeout 仍借助原 index 回填。跨 queue 原本没有全局顺序保证，first-touch 遍历不增加新语义。
 
-同一 bucket 按输入顺序 push index，queue 内语义不变。跨 queue 原本没有全局顺序保证。函数同步且不递归，不增加
-lease、mutex 或 reentrancy 判断。队列满时 `WaitForCapacity` 仍可能成为绝对热点，本次不改变反压语义。
+普通请求在 producer 线程内复用 TLS scratch；最多保留 16384-key 的 request-shaped arrays，异常大请求使用
+request-local scratch。lease 用 `in_use` 防止同线程嵌套调用覆盖外层状态，嵌套调用同样回退到 request-local scratch。
+512 个 queues、consumer clients 和 consumer threads 全部保留，`Sync(keys)` 继续按同一 hash 向 touched queues 放置
+barrier。队列满时 `WaitForCapacity` 仍可能成为绝对热点，本次不改变路由、反压或 Redis 命令语义。
 
 ### 6.9 去掉通用 RMW 临时 MetricsRegistry
 
@@ -530,7 +546,7 @@ next_index capacity，必须在实际请求线程数下核算 RSS。该项为独
 | pure-local retained handle逐 key化 | 不进入该 capability | 直接生效 | retained view/容量语义不变 |
 | Estimate 缓存 | local 写受益 | local 写受益 | CacheLocation special members需调整 |
 | fused charge/release | conditional update/delete 受益 | retained/general update/delete 受益 | `common/cache` 增加默认虚能力 |
-| Async queue buckets | 入队受益；cached RMW 中位于锁内 | 不使用 | 单 async Redis backend 也受益 |
+| Async routing scratch | 入队受益；cached RMW 中位于锁内 | 不使用 | 单 async Redis backend 也受益 |
 | 临时 MetricsRegistry 删除 | 通用 RMW 请求 CPU 下降 | 单 Location fast path无变化 | 其他通用 RMW backend 受益 |
 | shard batch plan | 通用 MakeBatches 受益 | 单 Location分组受益 | 每请求线程增加 TLS 常驻内存 |
 
@@ -566,8 +582,9 @@ cached 并发 compact 只能在 Running 进入；Recover 下 targeted Get、all-
 
 ### 9.6 TLS scratch
 
-Async queue buckets 和 shard scratch 不保存 key/payload 引用，只保留整数和 capacity。每次调用清理有效内容；
-occupied bitset 必须清零，不能只重置 heads/tails。线上同时观察 CPU 和每线程 RSS。
+Async routing scratch 和 shard scratch 不保存 key/payload 引用，只保留整数和 capacity。每次调用清理有效内容；
+queue-shaped 数组由已校验的 `async_queue_count <= 2048` 定界，occupied bitset 必须清零，不能只重置
+heads/tails。线上同时观察 CPU 和每线程 RSS。
 
 ## 10. 测试计划
 
@@ -618,7 +635,7 @@ occupied bitset 必须清零，不能只重置 heads/tails。线上同时观察 
 
 1. 修正 compact Get、generic targeted Get 和 pure-local retained-handle Get/Release 的逐 key LRU 路径。
 2. 实现 shared Estimate cache、fused charge/release 和 batch timestamp，并验证 charge/handle。
-3. 实现 Async Redis + Local 的 `UpsertConsume` 和最小 queue bucket 优化。
+3. 实现 Async Redis + Local 的 `UpsertConsume` 和 sparse routing scratch 优化。
 4. 为通用 RMW增加 cleanup guard/scratch 并移除临时 MetricsRegistry。
 5. 最后独立实现 shard batch plan；根据 CPU/RSS 结果决定是否保留。
 

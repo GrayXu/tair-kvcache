@@ -932,6 +932,157 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetQueueIndexForKey) {
     ASSERT_EQ(q1, q2);
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestSparseEnqueueRoutingPreservesOrderAndClearsTouchedQueues) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=512&async_max_size=100"
+                           "&async_enqueue_timeout_ms=0");
+    ASSERT_EQ(EC_OK, backend_->Init("sparse_routing", config_));
+    backend_->queues_.resize(backend_->queue_count_);
+    for (auto &queue : backend_->queues_) {
+        queue = std::make_unique<MpscWriteQueue>();
+    }
+
+    std::vector<KeyTypeVec> keys_by_queue(backend_->queue_count_);
+    size_t queues_with_two_keys = 0;
+    for (KeyType key = 0; key < 100000 && queues_with_two_keys < 3; ++key) {
+        const int queue_id = backend_->GetQueueIndexForKey(key);
+        auto &queue_keys = keys_by_queue[queue_id];
+        if (queue_keys.size() >= 2) {
+            continue;
+        }
+        queue_keys.push_back(key);
+        if (queue_keys.size() == 2) {
+            ++queues_with_two_keys;
+        }
+    }
+    ASSERT_EQ(3u, queues_with_two_keys);
+
+    std::vector<int> selected_queues;
+    for (int queue_id = 0; queue_id < backend_->queue_count_ && selected_queues.size() < 3; ++queue_id) {
+        if (keys_by_queue[queue_id].size() == 2) {
+            selected_queues.push_back(queue_id);
+        }
+    }
+    ASSERT_EQ(3u, selected_queues.size());
+
+    const KeyTypeVec first_keys{keys_by_queue[selected_queues[2]][0],
+                                keys_by_queue[selected_queues[0]][0],
+                                keys_by_queue[selected_queues[1]][0],
+                                keys_by_queue[selected_queues[2]][1],
+                                keys_by_queue[selected_queues[0]][1],
+                                keys_by_queue[selected_queues[1]][1]};
+    PropertyMapVector first_properties(first_keys.size());
+    for (size_t i = 0; i < first_properties.size(); ++i) {
+        first_properties[i]["position"] = std::to_string(i);
+    }
+    EXPECT_EQ(std::vector<ErrorCode>(first_keys.size(), EC_OK),
+              backend_->Put(nullptr, first_keys, CacheLocationMapVector(first_keys.size()), first_properties));
+
+    const std::vector<std::vector<size_t>> expected_positions{{1, 4}, {2, 5}, {0, 3}};
+    for (size_t selected_index = 0; selected_index < selected_queues.size(); ++selected_index) {
+        const int queue_id = selected_queues[selected_index];
+        int64_t taken_keys = 0;
+        auto items = backend_->queues_[queue_id]->PopBatch(/*max_batch_size=*/100, taken_keys);
+        ASSERT_EQ(2, taken_keys);
+        ASSERT_EQ(1u, items.size());
+        const auto &op = std::get<WriteOp>(items[0]);
+        ASSERT_EQ(2u, op.keys.size());
+        for (size_t i = 0; i < op.keys.size(); ++i) {
+            const size_t original_position = expected_positions[selected_index][i];
+            EXPECT_EQ(first_keys[original_position], op.keys[i]);
+            EXPECT_EQ(std::to_string(original_position), op.field_maps[i].at("position"));
+        }
+    }
+
+    const KeyTypeVec second_keys{keys_by_queue[selected_queues[1]][1], keys_by_queue[selected_queues[0]][0]};
+    PropertyMapVector second_properties(2);
+    second_properties[0]["round"] = "second-0";
+    second_properties[1]["round"] = "second-1";
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              backend_->Put(nullptr, second_keys, CacheLocationMapVector(2), second_properties));
+    for (size_t selected_index = 0; selected_index < 2; ++selected_index) {
+        const int queue_id = selected_queues[selected_index];
+        int64_t taken_keys = 0;
+        auto items = backend_->queues_[queue_id]->PopBatch(/*max_batch_size=*/100, taken_keys);
+        ASSERT_EQ(1, taken_keys);
+        ASSERT_EQ(1u, items.size());
+        const auto &op = std::get<WriteOp>(items[0]);
+        const size_t original_position = selected_index == 0 ? 1 : 0;
+        EXPECT_EQ(second_keys[original_position], op.keys[0]);
+        EXPECT_EQ("second-" + std::to_string(original_position), op.field_maps[0].at("round"));
+    }
+    int64_t stale_key_count = 0;
+    EXPECT_TRUE(
+        backend_->queues_[selected_queues[2]]->PopBatch(/*max_batch_size=*/100, stale_key_count).empty());
+    EXPECT_EQ(0, stale_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSparseEnqueueRoutingScattersTimeoutsToOriginalPositions) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=512&async_max_size=1"
+                           "&async_enqueue_timeout_ms=0");
+    ASSERT_EQ(EC_OK, backend_->Init("sparse_timeout", config_));
+    backend_->queues_.resize(backend_->queue_count_);
+    for (auto &queue : backend_->queues_) {
+        queue = std::make_unique<MpscWriteQueue>();
+    }
+
+    std::vector<KeyTypeVec> keys_by_queue(backend_->queue_count_);
+    size_t queues_with_two_keys = 0;
+    for (KeyType key = 0; key < 100000 && queues_with_two_keys < 2; ++key) {
+        const int queue_id = backend_->GetQueueIndexForKey(key);
+        auto &queue_keys = keys_by_queue[queue_id];
+        if (queue_keys.size() >= 2) {
+            continue;
+        }
+        queue_keys.push_back(key);
+        if (queue_keys.size() == 2) {
+            ++queues_with_two_keys;
+        }
+    }
+    ASSERT_EQ(2u, queues_with_two_keys);
+
+    std::vector<int> selected_queues;
+    for (int queue_id = 0; queue_id < backend_->queue_count_ && selected_queues.size() < 2; ++queue_id) {
+        if (keys_by_queue[queue_id].size() == 2) {
+            selected_queues.push_back(queue_id);
+        }
+    }
+    ASSERT_EQ(2u, selected_queues.size());
+    const int accepted_queue = selected_queues[0];
+    const int rejected_queue = selected_queues[1];
+
+    WriteOp filler;
+    filler.type = WriteOpType::kDelete;
+    filler.keys = {keys_by_queue[rejected_queue][0]};
+    backend_->queues_[rejected_queue]->Push(QueueItem{std::move(filler)});
+
+    const KeyTypeVec keys{keys_by_queue[accepted_queue][0],
+                          keys_by_queue[rejected_queue][0],
+                          keys_by_queue[accepted_queue][1],
+                          keys_by_queue[rejected_queue][1]};
+    PropertyMapVector properties(keys.size());
+    for (size_t i = 0; i < properties.size(); ++i) {
+        properties[i]["position"] = std::to_string(i);
+    }
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT, EC_OK, EC_TIMEOUT}),
+              backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), properties));
+
+    int64_t accepted_key_count = 0;
+    auto accepted_items = backend_->queues_[accepted_queue]->PopBatch(/*max_batch_size=*/100, accepted_key_count);
+    ASSERT_EQ(2, accepted_key_count);
+    ASSERT_EQ(1u, accepted_items.size());
+    const auto &accepted_op = std::get<WriteOp>(accepted_items[0]);
+    EXPECT_EQ((KeyTypeVec{keys[0], keys[2]}), accepted_op.keys);
+    ASSERT_EQ(2u, accepted_op.field_maps.size());
+    EXPECT_EQ("0", accepted_op.field_maps[0].at("position"));
+    EXPECT_EQ("2", accepted_op.field_maps[1].at("position"));
+
+    int64_t rejected_key_count = 0;
+    auto rejected_items = backend_->queues_[rejected_queue]->PopBatch(/*max_batch_size=*/100, rejected_key_count);
+    ASSERT_EQ(1, rejected_key_count);
+    ASSERT_EQ(1u, rejected_items.size());
+    EXPECT_EQ((KeyTypeVec{keys_by_queue[rejected_queue][0]}), std::get<WriteOp>(rejected_items[0]).keys);
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestUpsertSingleLocationsPreservesMultiQueueAlignmentAndOwnership) {
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=3&async_max_batch=64"
                            "&async_wait_us=1000&async_max_size=1000&async_enqueue_timeout_ms=0");

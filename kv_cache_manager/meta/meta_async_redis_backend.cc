@@ -4,6 +4,7 @@
 #include <charconv>
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -20,6 +21,70 @@
 namespace kv_cache_manager {
 
 namespace {
+
+// Retain request-shaped routing arrays for ordinary ReportEvent batches while
+// keeping unusually large requests request-local. Queue-shaped arrays remain
+// bounded by the validated async_queue_count limit.
+constexpr size_t kMaxRetainedEnqueueRoutingKeys = 16384;
+
+struct EnqueueRoutingScratch {
+    bool in_use = false;
+    std::vector<int> queue_ids;
+    std::vector<size_t> queue_counts;
+    std::vector<size_t> queue_starts;
+    std::vector<size_t> queue_cursors;
+    std::vector<size_t> ordered_indices;
+    std::vector<int> touched_queues;
+
+    void Prepare(size_t queue_count, size_t key_count) {
+        queue_ids.resize(key_count);
+        if (queue_counts.size() != queue_count) {
+            queue_counts.assign(queue_count, 0);
+            queue_starts.resize(queue_count);
+            queue_cursors.resize(queue_count);
+        } else {
+            for (const int queue_id : touched_queues) {
+                queue_counts[queue_id] = 0;
+            }
+        }
+        ordered_indices.resize(key_count);
+        touched_queues.clear();
+        touched_queues.reserve(std::min(queue_count, key_count));
+    }
+};
+
+EnqueueRoutingScratch &GetThreadLocalEnqueueRoutingScratch() {
+    thread_local EnqueueRoutingScratch scratch;
+    return scratch;
+}
+
+class EnqueueRoutingScratchLease {
+public:
+    EnqueueRoutingScratchLease(size_t queue_count, size_t key_count) {
+        EnqueueRoutingScratch &thread_local_scratch = GetThreadLocalEnqueueRoutingScratch();
+        if (key_count <= kMaxRetainedEnqueueRoutingKeys && !thread_local_scratch.in_use) {
+            scratch_ = &thread_local_scratch;
+        } else {
+            local_.emplace();
+            scratch_ = &*local_;
+        }
+        scratch_->Prepare(queue_count, key_count);
+        scratch_->in_use = true;
+    }
+
+    ~EnqueueRoutingScratchLease() { scratch_->in_use = false; }
+
+    EnqueueRoutingScratchLease(const EnqueueRoutingScratchLease &) = delete;
+    EnqueueRoutingScratchLease &operator=(const EnqueueRoutingScratchLease &) = delete;
+    EnqueueRoutingScratchLease(EnqueueRoutingScratchLease &&) = delete;
+    EnqueueRoutingScratchLease &operator=(EnqueueRoutingScratchLease &&) = delete;
+
+    EnqueueRoutingScratch &get() noexcept { return *scratch_; }
+
+private:
+    std::optional<EnqueueRoutingScratch> local_;
+    EnqueueRoutingScratch *scratch_ = nullptr;
+};
 
 template <typename T>
 void ResetBoundedVector(std::vector<T> &values, size_t retained_capacity) noexcept {
@@ -246,42 +311,51 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
     }
     const int64_t enqueue_begin_us = TimestampUtil::GetSteadyTimeUs();
 
-    thread_local std::vector<std::vector<size_t>> queue_indices;
     const size_t queue_count = static_cast<size_t>(queue_count_);
-    if (queue_indices.size() < queue_count) {
-        queue_indices.resize(queue_count);
+    EnqueueRoutingScratchLease routing_scratch_lease(queue_count, op.keys.size());
+    auto &routing = routing_scratch_lease.get();
+    for (size_t i = 0; i < op.keys.size(); ++i) {
+        const int queue_id = GetQueueIndexForKey(op.keys[i]);
+        routing.queue_ids[i] = queue_id;
+        if (routing.queue_counts[queue_id] == 0) {
+            routing.touched_queues.push_back(queue_id);
+        }
+        ++routing.queue_counts[queue_id];
     }
-    for (size_t qi = 0; qi < queue_count; ++qi) {
-        queue_indices[qi].clear();
+    size_t next_offset = 0;
+    for (const int queue_id : routing.touched_queues) {
+        routing.queue_starts[queue_id] = next_offset;
+        routing.queue_cursors[queue_id] = next_offset;
+        next_offset += routing.queue_counts[queue_id];
     }
     for (size_t i = 0; i < op.keys.size(); ++i) {
-        queue_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
+        const int queue_id = routing.queue_ids[i];
+        routing.ordered_indices[routing.queue_cursors[queue_id]++] = i;
     }
 
     int64_t enqueue_timeout_key_count = 0;
     std::vector<ErrorCode> error_codes(op.keys.size(), EC_OK);
-    for (int qi = 0; qi < queue_count_; ++qi) {
-        auto &indices = queue_indices[qi];
-        if (indices.empty()) {
-            continue;
-        }
+    for (const int queue_id : routing.touched_queues) {
+        const size_t begin = routing.queue_starts[queue_id];
+        const size_t count = routing.queue_counts[queue_id];
         WriteOp sub_op;
         sub_op.type = op.type;
-        sub_op.keys.reserve(indices.size());
+        sub_op.keys.reserve(count);
         if (!op.field_maps.empty()) {
-            sub_op.field_maps.reserve(indices.size());
-            sub_op.locations.reserve(indices.size());
+            sub_op.field_maps.reserve(count);
+            sub_op.locations.reserve(count);
         }
         if (!op.single_locations.empty()) {
-            sub_op.single_locations.reserve(indices.size());
+            sub_op.single_locations.reserve(count);
         }
         if (!op.single_location_ids.empty()) {
-            sub_op.single_location_ids.reserve(indices.size());
+            sub_op.single_location_ids.reserve(count);
         }
         if (!op.field_names_vec.empty()) {
-            sub_op.field_names_vec.reserve(indices.size());
+            sub_op.field_names_vec.reserve(count);
         }
-        for (size_t idx : indices) {
+        for (size_t position = begin; position < begin + count; ++position) {
+            const size_t idx = routing.ordered_indices[position];
             sub_op.keys.push_back(op.keys[idx]);
             if (!op.field_maps.empty()) {
                 sub_op.field_maps.push_back(std::move(op.field_maps[idx]));
@@ -298,15 +372,16 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             }
         }
 
-        const int64_t incoming_key_count = static_cast<int64_t>(indices.size());
-        if (!WaitForQueueCapacity(qi, incoming_key_count)) {
+        const int64_t incoming_key_count = static_cast<int64_t>(count);
+        if (!WaitForQueueCapacity(queue_id, incoming_key_count)) {
             enqueue_timeout_key_count += incoming_key_count;
-            for (size_t idx : indices) {
+            for (size_t position = begin; position < begin + count; ++position) {
+                const size_t idx = routing.ordered_indices[position];
                 error_codes[idx] = EC_TIMEOUT;
             }
             continue;
         }
-        queues_[qi]->Push(QueueItem{std::move(sub_op)});
+        queues_[queue_id]->Push(QueueItem{std::move(sub_op)});
     }
 
     const int64_t enqueue_time_us = TimestampUtil::GetSteadyTimeUs() - enqueue_begin_us;
