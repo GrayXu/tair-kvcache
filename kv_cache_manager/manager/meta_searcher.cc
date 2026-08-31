@@ -2954,7 +2954,9 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         out_missing_targets->resize(keys.size());
     }
 
-    bool use_single_location_fast_path = meta_indexer_->SupportsSingleLocationRmw();
+    // Temporarily keep DELETE on the generic RMW path while the compact path's
+    // runtime regression is investigated.
+    bool use_single_location_fast_path = false;
     std::unordered_set<int64_t> seen_keys;
     bool invalid_input = false;
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
