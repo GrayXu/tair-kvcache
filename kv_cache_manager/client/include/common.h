@@ -60,6 +60,9 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+    // Internal parallel task was stopped before it started backend I/O.
+    // SdkWrapper consumes this state; client APIs must never return it.
+    ER_TASK_CANCELLED = 118,
 };
 
 enum class QueryType : int {
@@ -216,6 +219,23 @@ struct SharedMemoryRegistration {
     void *base{nullptr};
     size_t size{0};
     int fd{-1};
+};
+
+struct GpuMemorySpan {
+    // Non-owning CUDA device address. The caller must keep the allocation alive
+    // until the TransferClient using this registration is destroyed.
+    void *base{nullptr};
+    size_t size{0};
+    // CUDA device that owns base. The wrapper forwards this value without
+    // validating the address-to-device mapping.
+    int device_id{-1};
+};
+
+struct ClientMemoryRegistrations {
+    // A default-constructed host registration means that only GPU memory, or no
+    // external memory, is registered.
+    SharedMemoryRegistration host;
+    std::vector<GpuMemorySpan> gpu;
 };
 
 struct InitParams {
