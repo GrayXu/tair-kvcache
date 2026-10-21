@@ -30,6 +30,21 @@ public:
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
     virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }
+
+    // Returns true if this backend can accept write operations (Create/Delete).
+    // When meta-service is unavailable, TairMempoolBackend returns false to
+    // indicate read-only mode, while still allowing read operations (Exist/MightExist).
+    // Default implementation returns Available() for backward compatibility.
+    virtual bool Writable() { return Available(); }
+
+    // True while the backend still serves reads but can no longer reclaim
+    // physical objects because its write path is down (read-only degradation).
+    // Existence verdicts are untrustworthy in this state and a delete cannot
+    // free space, so callers must defer metadata cleanup instead of dropping
+    // metadata and leaking storage. Backends without a read-only degraded mode
+    // keep the default false, which preserves their existing cleanup behaviour.
+    virtual bool InReadOnlyMode() { return false; }
+
     std::shared_ptr<DataStorageMetricsCollector> GetMetricsCollector() { return metrics_collector_; }
     virtual const StorageConfig &GetStorageConfig() { return config_; }
 
