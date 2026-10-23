@@ -30,6 +30,10 @@ public:
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris);
+    TransferResult GetWithResult(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
+    TransferResult PutWithResult(const std::vector<DataStorageUri> &remote_uris,
+                                 const BlockBuffers &local_buffers,
+                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris);
 
 private:
     enum class OpType : uint8_t {
@@ -54,9 +58,16 @@ private:
                                std::vector<SdkGroup> &groups);
 
     std::string getOpTypeString(OpType op_type) const;
-    ClientErrorCode RunWithTimeoutParallel(OpType op_type,
-                                           std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                           int timeout_ms) const;
+    TransferResult GetInternal(const std::vector<DataStorageUri> &remote_uris,
+                               const BlockBuffers &local_buffers,
+                               bool with_result);
+    TransferResult PutInternal(const std::vector<DataStorageUri> &remote_uris,
+                               const BlockBuffers &local_buffers,
+                               std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                               bool with_result);
+    TransferResult RunWithTimeoutParallel(OpType op_type,
+                                          std::vector<std::function<TransferResult()>> &&tasks,
+                                          int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);

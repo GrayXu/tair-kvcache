@@ -65,6 +65,13 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_TASK_CANCELLED = 118,
 };
 
+struct TransferResult {
+    ClientErrorCode error_code = ER_OK;
+    // Snapshot at return: no backend may access the caller's buffers again.
+    // False means unknown; it does not imply that an access is still active.
+    bool buffer_safe = false;
+};
+
 enum class QueryType : int {
     QT_UNSPECIFIED = 0,
     QT_BATCH_GET = 1,

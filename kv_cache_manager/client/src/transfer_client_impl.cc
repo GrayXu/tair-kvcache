@@ -144,17 +144,54 @@ void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
                                                  std::shared_ptr<TransferTraceInfo> trace_info) {
+    return LoadKvCachesInternal(uri_str_vec, block_buffers, std::move(trace_info), nullptr);
+}
+
+TransferResult TransferClientImpl::LoadKvCachesWithResult(const UriStrVec &uri_str_vec,
+                                                          const BlockBuffers &block_buffers,
+                                                          std::shared_ptr<TransferTraceInfo> trace_info) {
+    TransferResult result;
+    result.error_code = LoadKvCachesInternal(uri_str_vec, block_buffers, std::move(trace_info), &result.buffer_safe);
+    return result;
+}
+
+std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                     const BlockBuffers &block_buffers,
+                                                                     std::shared_ptr<TransferTraceInfo> trace_info) {
+    return SaveKvCachesInternal(uri_str_vec, block_buffers, std::move(trace_info), nullptr);
+}
+
+std::pair<TransferResult, UriStrVec> TransferClientImpl::SaveKvCachesWithResult(
+    const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers, std::shared_ptr<TransferTraceInfo> trace_info) {
+    TransferResult result;
+    auto [ec, uris] = SaveKvCachesInternal(uri_str_vec, block_buffers, std::move(trace_info), &result.buffer_safe);
+    result.error_code = ec;
+    return {result, std::move(uris)};
+}
+
+ClientErrorCode TransferClientImpl::LoadKvCachesInternal(const UriStrVec &uri_str_vec,
+                                                         const BlockBuffers &block_buffers,
+                                                         std::shared_ptr<TransferTraceInfo> trace_info,
+                                                         bool *buffer_safe) {
+    if (buffer_safe != nullptr) {
+        *buffer_safe = true;
+    }
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK();
     auto remote_uris = ParseLocations(uri_str_vec);
-    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers);
+    auto result = buffer_safe != nullptr ? sdk_wrapper_->GetWithResult(remote_uris, block_buffers)
+                                        : TransferResult{sdk_wrapper_->Get(remote_uris, block_buffers), false};
+    if (buffer_safe != nullptr) {
+        *buffer_safe = result.buffer_safe;
+    }
+    auto ec = result.error_code;
     if (ec != ER_OK) {
         return ec;
     }
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    if (is_check_buffer_) {
+    if (is_check_buffer_ && (buffer_safe == nullptr || *buffer_safe)) {
         bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
         std::vector<int64_t> block_hashs;
         if (need_print) {
@@ -168,9 +205,13 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     return ec;
 }
 
-std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                                       const BlockBuffers &block_buffers,
-                                                                       std::shared_ptr<TransferTraceInfo> trace_info) {
+std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCachesInternal(const UriStrVec &uri_str_vec,
+                                                                               const BlockBuffers &block_buffers,
+                                                                               std::shared_ptr<TransferTraceInfo> trace_info,
+                                                                               bool *buffer_safe) {
+    if (buffer_safe != nullptr) {
+        *buffer_safe = true;
+    }
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -189,7 +230,13 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    auto ec = sdk_wrapper_->Put(remote_uris, block_buffers, actual_remote_uris);
+    auto result = buffer_safe != nullptr
+                      ? sdk_wrapper_->PutWithResult(remote_uris, block_buffers, actual_remote_uris)
+                      : TransferResult{sdk_wrapper_->Put(remote_uris, block_buffers, actual_remote_uris), false};
+    if (buffer_safe != nullptr) {
+        *buffer_safe = result.buffer_safe;
+    }
+    auto ec = result.error_code;
     if (ec != ER_OK) {
         KVCM_LOG_ERROR("save kv cache failed");
         return {ec, {}};

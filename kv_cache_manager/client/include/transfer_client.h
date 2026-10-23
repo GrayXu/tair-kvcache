@@ -35,6 +35,21 @@ public:
                  const BlockBuffers &block_buffers,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
+    // Failures without an explicit backend proof leave buffer safety unknown.
+    virtual TransferResult LoadKvCachesWithResult(const UriStrVec &uri_str_vec,
+                                                  const BlockBuffers &block_buffers,
+                                                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) {
+        auto ec = LoadKvCaches(uri_str_vec, block_buffers, std::move(trace_info));
+        return {ec, ec == ER_OK};
+    }
+    virtual std::pair<TransferResult, UriStrVec>
+    SaveKvCachesWithResult(const UriStrVec &uri_str_vec,
+                           const BlockBuffers &block_buffers,
+                           std::shared_ptr<TransferTraceInfo> trace_info = nullptr) {
+        auto [ec, uris] = SaveKvCaches(uri_str_vec, block_buffers, std::move(trace_info));
+        return {{ec, ec == ER_OK}, std::move(uris)};
+    }
+
 protected:
     TransferClient() = default;
     virtual ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) = 0;

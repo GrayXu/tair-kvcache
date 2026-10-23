@@ -27,4 +27,8 @@ std::future<ClientErrorCode> LockFreeThreadPool::async(std::function<ClientError
     return pool_->async(func);
 }
 
+std::future<TransferResult> LockFreeThreadPool::async(std::function<TransferResult()> &&func) {
+    return pool_->async(func);
+}
+
 } // namespace kv_cache_manager

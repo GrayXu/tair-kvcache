@@ -27,11 +27,26 @@ public:
     SaveKvCaches(const UriStrVec &uri_str_vec,
                  const BlockBuffers &block_buffers,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
+    TransferResult LoadKvCachesWithResult(const UriStrVec &uri_str_vec,
+                                          const BlockBuffers &block_buffers,
+                                          std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
+    std::pair<TransferResult, UriStrVec>
+    SaveKvCachesWithResult(const UriStrVec &uri_str_vec,
+                           const BlockBuffers &block_buffers,
+                           std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
 
 private:
+    ClientErrorCode LoadKvCachesInternal(const UriStrVec &uri_str_vec,
+                                         const BlockBuffers &block_buffers,
+                                         std::shared_ptr<TransferTraceInfo> trace_info,
+                                         bool *buffer_safe);
+    std::pair<ClientErrorCode, UriStrVec> SaveKvCachesInternal(const UriStrVec &uri_str_vec,
+                                                               const BlockBuffers &block_buffers,
+                                                               std::shared_ptr<TransferTraceInfo> trace_info,
+                                                               bool *buffer_safe);
     ClientErrorCode InitWithSharedMemory(const std::string &client_config,
                                          const InitParams &init_params,
                                          const SharedMemoryRegistration &shared_memory_registration);

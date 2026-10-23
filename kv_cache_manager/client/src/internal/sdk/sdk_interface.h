@@ -45,6 +45,19 @@ public:
                                 const BlockBuffers &local_buffers,
                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) = 0;
 
+    // Legacy failures carry no proof that caller buffer accesses have stopped.
+    virtual TransferResult GetWithResult(const std::vector<DataStorageUri> &remote_uris,
+                                         const BlockBuffers &local_buffers) {
+        auto ec = Get(remote_uris, local_buffers);
+        return {ec, ec == ER_OK};
+    }
+    virtual TransferResult PutWithResult(const std::vector<DataStorageUri> &remote_uris,
+                                         const BlockBuffers &local_buffers,
+                                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+        auto ec = Put(remote_uris, local_buffers, actual_remote_uris);
+        return {ec, ec == ER_OK};
+    }
+
 protected:
     virtual ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
                                   std::vector<DataStorageUri> &alloc_uris) = 0;

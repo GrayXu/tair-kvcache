@@ -24,6 +24,7 @@ public:
     void waitFinish();
     bool isFull() const;
     std::future<ClientErrorCode> async(std::function<ClientErrorCode()> &&func);
+    std::future<TransferResult> async(std::function<TransferResult()> &&func);
 
 private:
     std::unique_ptr<autil::LockFreeThreadPool> pool_;
